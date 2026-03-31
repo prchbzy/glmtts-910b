@@ -630,31 +630,20 @@ class TTSFrontEnd:
         if isinstance(speech, str):
             speech = load_wav(speech, 16000)
 
-        if not isinstance(speech, torch.Tensor):
-            speech = torch.tensor(speech)
+        if torch.npu.is_available():
+            speech = speech.detach().to("cpu", dtype=torch.float32).contiguous()
 
-        # kaldi.fbank 输入建议 [1, T]
-        if speech.dim() == 1:
-            speech = speech.unsqueeze(0)
-
-        # 关键：强制 CPU + float32，避免 NPU 上 complex abs 报错
-        speech = speech.detach().to("cpu", dtype=torch.float32).contiguous()
-
-        feat = kaldi.fbank(
-            speech,
-            num_mel_bins=80,
-            dither=0.0,
-            sample_frequency=16000
-        )
+        feat = kaldi.fbank(speech,
+                           num_mel_bins=80,
+                           dither=0,
+                           sample_frequency=16000)
         feat = feat - feat.mean(dim=0, keepdim=True)
-
-        # ONNX 一般也是 CPU numpy
+        
+        # ONNX Inference
         input_name = self.campplus_session.get_inputs()[0].name
-        emb_np = self.campplus_session.run(
-            None, {input_name: feat.unsqueeze(0).cpu().numpy()}
-        )[0].reshape(1, -1).astype("float32")
-
-        embedding = torch.from_numpy(emb_np).to(self.device)
+        embedding = self.campplus_session.run(None, {input_name: feat.unsqueeze(dim=0).cpu().numpy()})[0].flatten().tolist()
+        
+        embedding = torch.tensor([embedding]).to(self.device)
         return embedding
 
     def _extract_speech_feat(self, speech, sample_rate=24000):

@@ -17,8 +17,16 @@ import json
 import logging
 import os
 import torch
-import torch_npu
-from torch_npu.contrib import transfer_to_npu 
+try:
+    import torch_npu
+    from torch_npu.contrib import transfer_to_npu
+    NPU_AVAILABLE = True
+except ImportError:
+    torch_npu = None
+    transfer_to_npu = None
+    NPU_AVAILABLE = False
+    print("Ascend NPU currently unavailable, fallback to other devices.")
+
 import torchaudio
 import tqdm
 
@@ -41,23 +49,24 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-from transformers.models.whisper.feature_extraction_whisper import WhisperFeatureExtractor
+if NPU_AVAILABLE:
+    from transformers.models.whisper.feature_extraction_whisper import WhisperFeatureExtractor
 
-# 备份原函数
-_orig_torch_fbank = WhisperFeatureExtractor._torch_extract_fbank_features
-_orig_hann_window = torch.hann_window
+    # 备份原函数
+    _orig_torch_fbank = WhisperFeatureExtractor._torch_extract_fbank_features
+    _orig_hann_window = torch.hann_window
 
-def _torch_fbank_cpu_only(self, waveform, device="cpu"):
-    if isinstance(waveform, torch.Tensor):
-        waveform = waveform.detach().to("cpu", dtype=torch.float32)
-    return _orig_torch_fbank(self, waveform, device="cpu")
+    def _torch_fbank_cpu_only(self, waveform, device="cpu"):
+        if isinstance(waveform, torch.Tensor):
+            waveform = waveform.detach().to("cpu", dtype=torch.float32)
+        return _orig_torch_fbank(self, waveform, device="cpu")
 
-def _hann_window_force_fp32(window_length, *args, **kwargs):
-    kwargs["dtype"] = torch.float32
-    return _orig_hann_window(window_length, *args, **kwargs)
+    def _hann_window_force_fp32(window_length, *args, **kwargs):
+        kwargs["dtype"] = torch.float32
+        return _orig_hann_window(window_length, *args, **kwargs)
 
-torch.hann_window = _hann_window_force_fp32
-WhisperFeatureExtractor._torch_extract_fbank_features = _torch_fbank_cpu_only
+    torch.hann_window = _hann_window_force_fp32
+    WhisperFeatureExtractor._torch_extract_fbank_features = _torch_fbank_cpu_only
 
 
 def get_special_token_ids(tokenize_fn):

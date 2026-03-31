@@ -41,17 +41,30 @@ GLM-TTS is a high-quality text-to-speech (TTS) synthesis system based on large l
 ### Environment Setup
 
 Ensure you use Python 3.10 - Python 3.12 versions.
-
+For GPU
 ```bash
 # Clone repository
 git clone https://github.com/zai-org/GLM-TTS.git
 cd GLM-TTS
 
-# For torch-npu dev version or x86 machine
-pip config set global.extra-index-url "https://download.pytorch.org/whl/cpu/"
-
 # Install dependencies
-python -m pip install -r requirements.txt --no-build-isolation
+pip install -r requirements.txt
+
+# Install reinforcement learning related dependencies (optional)
+cd grpo/modules
+git clone https://github.com/s3prl/s3prl
+git clone https://github.com/omine-me/LaughterSegmentation
+# Download wavlm_large_finetune.pth and place it in grpo/ckpt directory
+```
+
+For NPU
+```bash
+# Clone repository
+git clone https://github.com/zai-org/GLM-TTS.git
+cd GLM-TTS
+
+pip config set global.extra-index-url "https://download.pytorch.org/whl/cpu/"
+python -m pip install -r requirements_npu.txt --no-build-isolation
 
 # Install reinforcement learning related dependencies (optional)
 cd grpo/modules
