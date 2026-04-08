@@ -43,17 +43,17 @@ GLM-TTS is a high-quality text-to-speech (TTS) synthesis system based on large l
 Ensure you use Python 3.10 - Python 3.12 versions.
 ### For GPU
 ```bash
-# Clone repository
-git clone https://dev.aminer.cn/duanchengxin/glm-tts.git
-cd glm-tts
+# # Clone repository
+# git clone https://dev.aminer.cn/duanchengxin/glm-tts.git
+# cd glm-tts
 
-# Install dependencies
-pip install -r requirements.txt
+# # Install dependencies
+# pip install -r requirements.txt
 
-# Install reinforcement learning related dependencies (optional)
-cd grpo/modules
-git clone https://github.com/s3prl/s3prl
-git clone https://github.com/omine-me/LaughterSegmentation
+# # Install reinforcement learning related dependencies (optional)
+# cd grpo/modules
+# git clone https://github.com/s3prl/s3prl
+# git clone https://github.com/omine-me/LaughterSegmentation
 # Download wavlm_large_finetune.pth and place it in grpo/ckpt directory
 ```
 
