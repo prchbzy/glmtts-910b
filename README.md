@@ -63,8 +63,8 @@ Obtain CANN image
 # Update DEVICE according to your device (/dev/davinci[0-7])
 export DEVICE=/dev/davinci0
 # Update the vllm-ascend image
-sudo docker tag uhub.service.ucloud.cn/live/glm-tts-ascend-vllm:0408 glm-tts-ascend-vllm:v1.0
-export IMAGE=glm-tts-ascend-vllm:v1.0
+sudo docker pull uhub.service.ucloud.cn/live/glm-tts-ascend-vllm:0408
+export IMAGE=uhub.service.ucloud.cn/live/glm-tts-ascend-vllm:0408
 sudo docker run \
     --name glmtts-vllm-td-0408 \
     -p 8048:8048 \
