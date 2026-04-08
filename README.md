@@ -60,6 +60,7 @@ git clone https://github.com/omine-me/LaughterSegmentation
 ### For NPU
 Obtain CANN image
 ```bash
+注：因为使用了vllm加速，首次生成音频需要录制静态图，耗时5min左右
 # Update DEVICE according to your device (/dev/davinci[0-7])
 export DEVICE=/dev/davinci0
 # Update the vllm-ascend image
@@ -85,16 +86,17 @@ sudo docker run \
 ```
 ```bash
 # Clone repository
-git clone https://github.com/zai-org/GLM-TTS.git
-cd GLM-TTS
+cd /code
+git clone https://dev.aminer.cn/duanchengxin/glm-tts.git
+cd glm-tts
 
-pip config set global.extra-index-url "https://download.pytorch.org/whl/cpu/"
-python -m pip install -r requirements_npu.txt --no-build-isolation
+# pip config set global.extra-index-url "https://download.pytorch.org/whl/cpu/"
+# python -m pip install -r requirements_npu.txt --no-build-isolation
 
 # Install reinforcement learning related dependencies (optional)
-cd grpo/modules
-git clone https://github.com/s3prl/s3prl
-git clone https://github.com/omine-me/LaughterSegmentation
+# cd grpo/modules
+# git clone https://github.com/s3prl/s3prl
+# git clone https://github.com/omine-me/LaughterSegmentation
 # Download wavlm_large_finetune.pth and place it in grpo/ckpt directory
 ```
 
@@ -123,14 +125,8 @@ modelscope download --model ZhipuAI/GLM-TTS --local_dir ckpt
 python glmtts_inference.py \
     --data=example_zh \
     --exp_name=_test \
-    --use_cache \
-    # --phoneme # Add this flag to enable phoneme capabilities.
-```
-
-#### Shell Script Inference
-
-```bash
-bash glmtts_inference.sh
+    --llm_dtype bf16 \
+    --use_cache
 ```
 
 #### Interactive Web Interface
