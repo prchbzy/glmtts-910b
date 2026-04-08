@@ -513,9 +513,20 @@ class HiFTGenerator(nn.Module):
         magnitude = torch.clip(magnitude, max=1e2)
         real = magnitude * torch.cos(phase)
         img = magnitude * torch.sin(phase)
-        inverse_transform = torch.istft(torch.complex(real, img), self.istft_params["n_fft"], self.istft_params["hop_len"],
-                                        self.istft_params["n_fft"], window=self.stft_window.to(magnitude.device))
-        return inverse_transform
+        
+        device_backup = magnitude.device
+        spec_cpu = torch.complex(real, img).to("cpu")
+        window_cpu = self.stft_window.to("cpu")
+        
+        inverse_transform_cpu = torch.istft(
+            spec_cpu, 
+            self.istft_params["n_fft"], 
+            self.istft_params["hop_len"],
+            self.istft_params["n_fft"], 
+            window=window_cpu
+        )
+        
+        return inverse_transform_cpu.to(device_backup)
 
     def decode(self, x: torch.Tensor, s: torch.Tensor = torch.zeros(1, 1, 0)) -> torch.Tensor:
         s_stft_real, s_stft_imag = self._stft(s.squeeze(1))

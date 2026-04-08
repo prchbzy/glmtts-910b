@@ -11,60 +11,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import gradio as gr
-import torch
-import numpy as np
 import logging
 import os
-from glmtts_inference import (
-    load_models,
-    generate_long,
-    DEVICE
-)
+
+import gradio as gr
+
+try:
+    from tools.inference_service import clear_memory, run_gradio_inference
+except ImportError:
+    from inference_service import clear_memory, run_gradio_inference
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# Global cache to store loaded models
-MODEL_CACHE = {
-    "loaded": False,
-    "sample_rate": None,
-    "components": None
-}
-
-def get_models(use_phoneme=False, sample_rate=24000):
-    """
-    Lazy loader for models. Reloads if sample_rate changes.
-    """
-    # Check if loaded and if sample_rate matches
-    if MODEL_CACHE["loaded"] and MODEL_CACHE["sample_rate"] == sample_rate:
-        return MODEL_CACHE["components"]
-    
-    logging.info(f"Loading models with sample_rate={sample_rate}...")
-    
-    # Clean up old models if they exist to save VRAM before loading new ones
-    if MODEL_CACHE["components"]:
-        del MODEL_CACHE["components"]
-        import gc
-        gc.collect()
-        torch.cuda.empty_cache()
-
-    # Load models using the function from glmtts_inference.py
-    frontend, text_frontend, speech_tokenizer, llm, flow = load_models(
-        use_phoneme=use_phoneme, 
-        sample_rate=sample_rate
-    )
-    
-    MODEL_CACHE["components"] = (frontend, text_frontend, speech_tokenizer, llm, flow)
-    MODEL_CACHE["sample_rate"] = sample_rate
-    MODEL_CACHE["loaded"] = True
-    logging.info("Models loaded successfully.")
-    return MODEL_CACHE["components"]
 
 def run_inference(prompt_text, prompt_audio_path, input_text, seed, sample_rate, use_cache=True):
-    """
-    Main inference handler for Gradio.
-    """
     if not input_text:
         raise gr.Error("Please provide text to synthesize.")
     if not prompt_audio_path:
@@ -73,87 +34,19 @@ def run_inference(prompt_text, prompt_audio_path, input_text, seed, sample_rate,
         gr.Warning("Prompt text is empty. Results might be suboptimal.")
 
     try:
-        # 1. Load Models (Pass sample_rate)
-        frontend, text_frontend, _, llm, flow = get_models(use_phoneme=True, sample_rate=sample_rate)
-
-        # 2. Pre-process Prompt (Text Normalization)
-        norm_prompt_text = text_frontend.text_normalize(prompt_text) + ' '
-        norm_input_text = text_frontend.text_normalize(input_text)
-        
-        logging.info(f"Normalized Prompt: {norm_prompt_text}")
-        logging.info(f"Normalized Input: {norm_input_text}")
-
-        # 3. Extract Features & Tokens
-        # Extract prompt text tokens
-        prompt_text_token = frontend._extract_text_token(norm_prompt_text)
-        
-        # Extract prompt speech tokens (expects a list of paths)
-        prompt_speech_token = frontend._extract_speech_token([prompt_audio_path])
-        
-        # Extract speech features and speaker embedding for Flow
-        # Update: Pass sample_rate to feature extraction
-        speech_feat = frontend._extract_speech_feat(prompt_audio_path, sample_rate=sample_rate)
-        embedding = frontend._extract_spk_embedding(prompt_audio_path)
-
-        # 4. Prepare Cache Dictionary
-        cache_speech_token_list = [prompt_speech_token.squeeze().tolist()]
-        flow_prompt_token = torch.tensor(cache_speech_token_list, dtype=torch.int32).to(DEVICE)
-        
-        cache = {
-            'cache_text': [norm_prompt_text],
-            'cache_text_token': [prompt_text_token],
-            'cache_speech_token': cache_speech_token_list,
-            'use_cache': use_cache
-        }
-
-        # 5. Run Generation
-        tts_speech, _, _, _ = generate_long(
-            frontend=frontend,
-            text_frontend=text_frontend,
-            llm=llm,
-            flow=flow,
-            text_info=['', norm_input_text],
-            cache=cache,
-            embedding=embedding,
-            flow_prompt_token=flow_prompt_token,
-            speech_feat=speech_feat,
-            sample_method="ras",
+        return run_gradio_inference(
+            prompt_text=prompt_text,
+            prompt_audio_path=prompt_audio_path,
+            input_text=input_text,
             seed=seed,
-            device=DEVICE,
-            use_phoneme=False
+            sample_rate=sample_rate,
+            use_cache=use_cache,
         )
-
-        # 6. Post-process Audio
-        # Convert torch tensor to int16 numpy array for Gradio
-        audio_data = tts_speech.squeeze().cpu().numpy()
-        # Clamp to ensure no clipping before conversion
-        audio_data = np.clip(audio_data, -1.0, 1.0)
-        audio_int16 = (audio_data * 32767.0).astype(np.int16)
-
-        # Update: Return dynamic sample_rate instead of hardcoded 32000
-        return (sample_rate, audio_int16)
-
     except Exception as e:
         logging.error(f"Inference failed: {e}")
         import traceback
         traceback.print_exc()
         raise gr.Error(f"Inference failed: {str(e)}")
-
-def clear_memory():
-    """
-    Clears VRAM and resets the model cache.
-    """
-    global MODEL_CACHE
-    if MODEL_CACHE["components"]:
-        del MODEL_CACHE["components"]
-    MODEL_CACHE["components"] = None
-    MODEL_CACHE["loaded"] = False
-    MODEL_CACHE["sample_rate"] = None
-    
-    import gc
-    gc.collect()
-    torch.cuda.empty_cache()
-    return "Memory cleared. Models will reload on next inference."
 
 # --- Gradio UI Layout ---
 
@@ -209,7 +102,7 @@ with gr.Blocks(title="GLMTTS Inference") as app:
     generate_btn.click(
         fn=run_inference,
         inputs=[prompt_text, prompt_audio, input_text, seed, sample_rate, use_cache],
-        outputs=[output_audio]
+        outputs=[output_audio, status_msg]
     )
 
     clear_btn.click(

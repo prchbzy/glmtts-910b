@@ -24,6 +24,7 @@ import inflect
 import onnxruntime
 import torch
 import torchaudio
+import soundfile as sf
 import torchaudio.compliance.kaldi as kaldi
 
 # Local imports
@@ -68,7 +69,12 @@ class SpeechTokenizer:
                 if isinstance(utt, tuple):
                     audio, sample_rate = utt
                 else:
-                    audio, sample_rate = torchaudio.load(utt)
+                    # import torchaudio
+                    data, sample_rate = sf.read(utt)
+                    # 转换为 Tensor，并确保维度是 [1, samples]
+                    audio = torch.from_numpy(data).float()
+                    if audio.ndim == 1:
+                        audio = audio.unsqueeze(0)
 
                 audio = audio.cuda()
 
@@ -144,7 +150,7 @@ class TextFrontEnd:
                 remove_erhua=False,
                 full_to_half=True,
                 remove_interjections=False,
-                overwrite_cache=True
+                overwrite_cache=False
             )
             self.en_tn_model = EnNormalizer()
 
@@ -601,14 +607,9 @@ class TTSFrontEnd:
         option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
         option.intra_op_num_threads = 1
         
-        # Determine providers based on availability
+        # CANN EP conflicts with torch_npu ACL lifecycle in this process.
+        # CampPlus speaker embedding is lightweight, so keep ORT on CPU for stability.
         providers = ['CPUExecutionProvider']
-        if torch.cuda.is_available():
-             providers.insert(0, ('CUDAExecutionProvider', {
-                 'device_id': 0,
-                 'arena_extend_strategy': 'kSameAsRequested',
-                 'cudnn_conv_algo_search': 'DEFAULT',
-             }))
 
         self.campplus_session = onnxruntime.InferenceSession(campplus_model, sess_options=option, providers=providers)
         self.speech_tokenizer = speech_tokenizer
@@ -628,7 +629,7 @@ class TTSFrontEnd:
 
     def _extract_spk_embedding(self, speech: Union[str, torch.Tensor]) -> torch.Tensor:
         if isinstance(speech, str):
-            speech = load_wav(speech, 16000)
+            speech, _ = load_wav(speech, 16000)
 
         if torch.npu.is_available():
             speech = speech.detach().to("cpu", dtype=torch.float32).contiguous()
@@ -648,7 +649,7 @@ class TTSFrontEnd:
 
     def _extract_speech_feat(self, speech, sample_rate=24000):
         if isinstance(speech, str):
-            speech = load_wav(speech, sample_rate)
+            speech, _ = load_wav(speech, sample_rate)
         speech = speech.to(self.device)
         speech_feat = self.feat_extractor(speech).squeeze(dim=0).transpose(0, 1).to(self.device)
         speech_feat = speech_feat.unsqueeze(dim=0)

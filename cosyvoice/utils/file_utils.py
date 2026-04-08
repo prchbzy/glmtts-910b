@@ -16,7 +16,9 @@
 
 import json
 import torchaudio
-
+import soundfile as sf
+import torch
+import torchaudio.transforms as T
 
 def read_lists(list_file):
     lists = []
@@ -33,17 +35,19 @@ def read_json_lists(list_file):
             results.update(json.load(fin))
     return results
 
-def load_wav(wav, target_sr):
-    speech, sample_rate = torchaudio.load(wav)
-    speech = speech.to("cuda")
-    speech = speech.mean(dim=0, keepdim=True)
-    if sample_rate != target_sr:
-        resampler = torchaudio.transforms.Resample(
-                    orig_freq=sample_rate,
-                    new_freq=target_sr
-                ).to('cuda')
-        speech = resampler(speech).to("cuda")
-    return speech
+def load_wav(wav, target_sample_rate):
+    data, sr = sf.read(wav)
+    speech = torch.from_numpy(data).float()
+    
+    if speech.ndim == 1:
+        speech = speech.unsqueeze(0)
+    elif speech.shape[0] > 1:
+        speech = speech.mean(dim=0, keepdim=True)
+
+    if sr != target_sample_rate:
+        resampler = T.Resample(sr, target_sample_rate)
+        speech = resampler(speech)
+    return speech, target_sample_rate
 
 def speed_change(waveform, sample_rate, speed_factor: str):
     effects = [

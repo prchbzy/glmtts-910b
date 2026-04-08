@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import json
+import time
 import yaml
 from typing import Union, Optional, List, Dict, Any
 import torch
 import torch.nn as nn
-from transformers import LlamaConfig, LlamaForCausalLM
+from transformers import LlamaConfig, LlamaForCausalLM, StaticCache
 from peft import LoraConfig, get_peft_model, TaskType
 from cosyvoice.utils import common
 
@@ -110,6 +111,18 @@ class GLMTTS(nn.Module):
         self.eoa = special_token_ids['eoa']
         self.pad = special_token_ids['pad']
 
+    def _set_npu_compile_mode(self, enabled: bool) -> None:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.set_compile_mode(jit_compile=enabled)
+
+    def _bucket_cache_len(self, required_len: int, bucket_size: int = 128) -> int:
+        max_positions = getattr(self.llama.config, "max_position_embeddings", None)
+        if max_positions is not None and required_len > max_positions:
+            raise ValueError(
+                f"required cache length {required_len} exceeds model max_position_embeddings={max_positions}"
+            )
+        return ((required_len + bucket_size - 1) // bucket_size) * bucket_size
+
     def sampling_ids(
         self,
         weighted_scores: torch.Tensor,
@@ -188,7 +201,7 @@ class GLMTTS(nn.Module):
         if prompt_speech_token_len != 0 and prompt_text_len != 0:
             prompt_speech_token = prompt_speech_token + self.ats
 
-        # 2. Construct Input Embeddings
+        # 2. Construct Input IDs
         boa_tensor = torch.tensor([self.boa], device=device).unsqueeze(0)
         
         if self.mode == "SFT":
@@ -206,8 +219,6 @@ class GLMTTS(nn.Module):
                 prompt_speech_token
             ], dim=1).to(torch.long)
             
-            inputs_embeds = self.llama_embedding(input_ids)
-            
         elif self.mode in ["PRETRAIN", "LORA"]:
             # Concatenate: [Text Prompt, Text, BOA, Speech Prompt]
             input_ids = torch.cat([
@@ -216,64 +227,89 @@ class GLMTTS(nn.Module):
                 boa_tensor, 
                 prompt_speech_token
             ], dim=1).to(torch.long)
-            
-            inputs_embeds = self.llama_embedding(input_ids)
         else:
             raise ValueError(f"Invalid mode: {self.mode}")
 
         # 3. Calculate Generation Bounds
         min_len = int(text_len * min_token_text_ratio)
         max_len = int(text_len * max_token_text_ratio)
+        prefill_len = input_ids.shape[1]
+        cache_len_bucket = self._bucket_cache_len(prefill_len + max_len)
+        static_cache = StaticCache(config=self.llama.config, max_cache_len=cache_len_bucket)
+        required_cache_len = prefill_len + max_len
+        bucket_overhead = cache_len_bucket - required_cache_len
+        print(
+            f"[llm_bucket] prefill_len={prefill_len} max_len={max_len} "
+            f"required_cache_len={required_cache_len} cache_len_bucket={cache_len_bucket} "
+            f"bucket_overhead={bucket_overhead}"
+        )
 
         # 4. Step-by-Step Decoding
         out_tokens = []
-        past_key_values = None
+        current_input_ids = None
 
-        for i in range(max_len):
-            model_input = {
-                "inputs_embeds": inputs_embeds,
-                "output_hidden_states": True,
-                "return_dict": True,
-                "use_cache": True,
-                "past_key_values": past_key_values
-            }
+        # Prefill stays in eager mode because the full prompt length is still dynamic.
+        self._set_npu_compile_mode(False)
+        prefill_outputs = self.llama(
+            input_ids=input_ids,
+            use_cache=True,
+            past_key_values=static_cache,
+            cache_position=torch.arange(prefill_len, device=device),
+            logits_to_keep=torch.tensor([prefill_len - 1], device=device),
+        )
+        logp = prefill_outputs["logits"][:, -1].log_softmax(dim=-1)
 
-            outputs = self.llama(**model_input)
-            past_key_values = outputs['past_key_values']
-            
-            # Get logits of the last token
-            logp = outputs['logits'][:, -1].log_softmax(dim=-1)
-                
-            # --- Sampling Logic ---
-            if sample_method == "ras":
-                # Mask the EOS token logit to negative infinity to prevent early stopping
-                # if we haven't reached the minimum length.
-                if i < min_len:
-                    logp[:, self.eoa] = -float('inf')
-                
-                top_ids = self.sampling_ids_ras(
-                    logp.squeeze(dim=0), 
-                    out_tokens, 
-                    sampling
-                ).item()
-            elif sample_method == "topk":
-                top_ids = self.sampling_ids(
-                    logp.squeeze(dim=0), 
-                    sampling, 
-                    beam_size,
-                    ignore_eos=(i < min_len)
-                ).item()
-            else:
-                raise ValueError(f"Unknown sample_method: {sample_method}")
+        # Decode steps reuse a bucketed StaticCache so the hot loop sees a stable cache shape.
+        self._set_npu_compile_mode(True)
+        decode_start = time.perf_counter()
+        try:
+            for i in range(max_len):
+                # --- Sampling Logic ---
+                if sample_method == "ras":
+                    # Mask the EOS token logit to negative infinity to prevent early stopping
+                    # if we haven't reached the minimum length.
+                    if i < min_len:
+                        logp[:, self.eoa] = -float('inf')
+                    
+                    top_ids = self.sampling_ids_ras(
+                        logp.squeeze(dim=0), 
+                        out_tokens, 
+                        sampling
+                    ).item()
+                elif sample_method == "topk":
+                    top_ids = self.sampling_ids(
+                        logp.squeeze(dim=0), 
+                        sampling, 
+                        beam_size,
+                        ignore_eos=(i < min_len)
+                    ).item()
+                else:
+                    raise ValueError(f"Unknown sample_method: {sample_method}")
 
-            # Check for End of Audio
-            if top_ids == self.eoa:
-                break
-                
-            out_tokens.append(top_ids)
-            
-            # Prepare input for the next step (auto-regressive)
-            inputs_embeds = self.llama_embedding(torch.LongTensor([top_ids]).to(device))[None]
+                # Check for End of Audio
+                if top_ids == self.eoa:
+                    break
+                    
+                out_tokens.append(top_ids)
+                current_input_ids = torch.tensor([[top_ids]], dtype=torch.long, device=device)
+
+                decode_outputs = self.llama(
+                    input_ids=current_input_ids,
+                    use_cache=True,
+                    past_key_values=static_cache,
+                    cache_position=torch.tensor([prefill_len + i], dtype=torch.long, device=device),
+                    logits_to_keep=1,
+                )
+                logp = decode_outputs["logits"][:, -1].log_softmax(dim=-1)
+        finally:
+            self._set_npu_compile_mode(False)
+        decode_elapsed = time.perf_counter() - decode_start
+        decode_steps = len(out_tokens)
+        sec_per_token = decode_elapsed / decode_steps if decode_steps > 0 else 0.0
+        print(
+            f"[llm_decode] decode_steps={decode_steps} decode_seconds={decode_elapsed:.3f} "
+            f"sec_per_token={sec_per_token:.4f}"
+        )
 
         # 5. Validation and Output Construction
         # Ensure all tokens are within the valid audio token range
