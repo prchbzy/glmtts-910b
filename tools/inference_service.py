@@ -56,7 +56,6 @@ MODEL_CACHE = {
 
 def get_runtime_config():
     return {
-        "llm_backend": SERVICE_LLM_BACKEND,
         "hf_attn_implementation": SERVICE_HF_ATTN_IMPLEMENTATION,
         "hf_graph_decode": SERVICE_HF_GRAPH_DECODE,
         "hf_graph_max_cache_len": SERVICE_HF_GRAPH_MAX_CACHE_LEN,
@@ -82,11 +81,6 @@ def get_models(use_phoneme=False, sample_rate=24000):
     frontend, text_frontend, speech_tokenizer, llm, flow = load_models(
         use_phoneme=use_phoneme,
         sample_rate=sample_rate,
-        llm_backend=SERVICE_LLM_BACKEND,
-        hf_attn_implementation=SERVICE_HF_ATTN_IMPLEMENTATION,
-        hf_graph_decode=SERVICE_HF_GRAPH_DECODE,
-        hf_graph_max_cache_len=SERVICE_HF_GRAPH_MAX_CACHE_LEN,
-        hf_graph_warmup_iters=SERVICE_HF_GRAPH_WARMUP_ITERS,
     )
 
     MODEL_CACHE["components"] = (frontend, text_frontend, speech_tokenizer, llm, flow)
@@ -119,7 +113,6 @@ def audio_to_base64_wav(sample_rate, audio_int16):
 
 def format_status_text(result):
     return (
-        f"backend={result['config']['llm_backend']} "
         f"graph_decode={result['config']['hf_graph_decode']} "
         f"attn={result['config']['hf_attn_implementation']} | "
         f"elapsed={result['elapsed_seconds']:.3f}s "

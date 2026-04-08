@@ -44,8 +44,8 @@ Ensure you use Python 3.10 - Python 3.12 versions.
 ### For GPU
 ```bash
 # Clone repository
-git clone https://github.com/zai-org/GLM-TTS.git
-cd GLM-TTS
+git clone https://dev.aminer.cn/duanchengxin/glm-tts.git
+cd glm-tts
 
 # Install dependencies
 pip install -r requirements.txt
@@ -61,12 +61,14 @@ git clone https://github.com/omine-me/LaughterSegmentation
 Obtain CANN image
 ```bash
 # Update DEVICE according to your device (/dev/davinci[0-7])
-export DEVICE=/dev/davinci7
+export DEVICE=/dev/davinci0
 # Update the vllm-ascend image
-export IMAGE=quay.io/ascend/cann:8.5.1-910b-ubuntu22.04-py3.11
-docker run --rm \
-    --name vllm-ascend-env \
-    --shm-size=1g \
+sudo docker tag uhub.service.ucloud.cn/live/glm-tts-ascend-vllm:0408 glm-tts-ascend-vllm:v1.0
+export IMAGE=glm-tts-ascend-vllm:v1.0
+sudo docker run \
+    --name glmtts-vllm-td-0408 \
+    -p 8048:8048 \
+    --shm-size=16g \
     --device $DEVICE \
     --device /dev/davinci_manager \
     --device /dev/devmm_svm \
@@ -76,7 +78,9 @@ docker run --rm \
     -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
     -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
+    -v $(pwd):/code \
     -v /root/.cache:/root/.cache \
+    -e ASCEND_VISIBLE_DEVICES=0 \
     -it $IMAGE bash
 ```
 ```bash

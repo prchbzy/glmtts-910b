@@ -400,7 +400,7 @@ def local_flow_forward(flow, token_list, prompt_speech_tokens, speech_feat, embe
     """
     wav, full_mel = flow.token2wav_with_cache(
         token_list,
-        n_timesteps=12,
+        n_timesteps=11,
         prompt_token=prompt_speech_tokens,
         prompt_feat=speech_feat,
         embedding=embedding,
