@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import tempfile
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -35,8 +36,6 @@ except ImportError:
     )
 
 
-app = FastAPI(title="GLMTTS API", version="1.0.0")
-
 API_FILES_ROOT = Path(
     os.environ.get(
         "GLMTTS_API_FILES_ROOT",
@@ -49,6 +48,12 @@ PUBLIC_BASE_URL = os.environ.get("GLMTTS_PUBLIC_BASE_URL", "").rstrip("/")
 MONGO_URI = os.environ.get("GLMTTS_MONGO_URI", "mongodb://127.0.0.1:27017")
 MONGO_DB_NAME = os.environ.get("GLMTTS_MONGO_DB", "glmtts")
 MONGO_VOICE_COLLECTION = os.environ.get("GLMTTS_MONGO_VOICE_COLLECTION", "voices")
+MONGO_ENABLED = os.environ.get("GLMTTS_API_USE_MONGO", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 _MONGO_CLIENT = None
 _MONGO_COLLECTION = None
 VOICE_INDEX_FILE = VOICE_FILES_DIR / "voice_index.json"
@@ -56,6 +61,27 @@ VOICE_INDEX_FILE = VOICE_FILES_DIR / "voice_index.json"
 VOICE_FILES_DIR.mkdir(parents=True, exist_ok=True)
 GENERATED_FILES_DIR.mkdir(parents=True, exist_ok=True)
 
+
+def _close_mongo_client():
+    global _MONGO_CLIENT, _MONGO_COLLECTION
+    if _MONGO_CLIENT is not None:
+        try:
+            _MONGO_CLIENT.close()
+        except Exception:
+            pass
+    _MONGO_CLIENT = None
+    _MONGO_COLLECTION = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        yield
+    finally:
+        _close_mongo_client()
+
+
+app = FastAPI(title="GLMTTS API", version="1.0.0", lifespan=lifespan)
 app.mount("/files", StaticFiles(directory=str(API_FILES_ROOT)), name="media_files")
 
 
@@ -65,6 +91,7 @@ class GenerateTTSRequest(BaseModel):
     seed: int = 42
     sample_rate: int = 24000
     use_cache: bool = True
+    llm_backend: str | None = None
 
 
 def _parse_bool(value, default=False):
@@ -94,6 +121,8 @@ def _write_voice_index(data):
 
 def _try_get_voice_collection():
     global _MONGO_CLIENT, _MONGO_COLLECTION
+    if not MONGO_ENABLED:
+        return None
     if _MONGO_COLLECTION is not None:
         return _MONGO_COLLECTION
 
@@ -108,8 +137,7 @@ def _try_get_voice_collection():
         _MONGO_COLLECTION = _MONGO_CLIENT[MONGO_DB_NAME][MONGO_VOICE_COLLECTION]
         return _MONGO_COLLECTION
     except Exception:
-        _MONGO_CLIENT = None
-        _MONGO_COLLECTION = None
+        _close_mongo_client()
         return None
 
 
@@ -300,6 +328,7 @@ async def generate_tts_endpoint(
             seed=payload.seed,
             sample_rate=payload.sample_rate,
             use_cache=payload.use_cache,
+            llm_backend=payload.llm_backend,
         )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -328,6 +357,7 @@ async def synthesize_endpoint(
     seed: int = Form(42),
     sample_rate: int = Form(24000),
     use_cache: str = Form("true"),
+    llm_backend: str | None = Form(None),
     prompt_audio_path: str | None = Form(None),
     response_format: str = Form("json"),
     prompt_audio: UploadFile | None = File(None),
@@ -346,6 +376,7 @@ async def synthesize_endpoint(
             seed=seed,
             sample_rate=sample_rate,
             use_cache=_parse_bool(use_cache, default=True),
+            llm_backend=llm_backend,
         )
     except HTTPException:
         raise

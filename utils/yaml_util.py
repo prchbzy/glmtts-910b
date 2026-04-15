@@ -34,6 +34,7 @@ def load_flow_model(flow_ckpt_path, config_path, device):
 
     flow.to(device)
     flow.eval()
+    print(f"[load_flow_model] flow dtype: {next(flow.parameters()).dtype}")
     return flow
 
 def load_quantize_encoder(model_path):

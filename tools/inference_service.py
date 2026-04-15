@@ -28,21 +28,21 @@ def _env_flag(name, default=False):
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-SERVICE_LLM_BACKEND = os.environ.get("GLMTTS_GRADIO_LLM_BACKEND", "vllm")
-SERVICE_HF_ATTN_IMPLEMENTATION = os.environ.get(
-    "GLMTTS_GRADIO_HF_ATTN_IMPLEMENTATION", None
+SERVICE_DEFAULT_LLM_BACKEND = os.environ.get("GLMTTS_GRADIO_LLM_BACKEND", "hf")
+SERVICE_DEFAULT_HF_ATTN_IMPLEMENTATION = os.environ.get(
+    "GLMTTS_GRADIO_HF_ATTN_IMPLEMENTATION", "eager"
 )
-SERVICE_HF_GRAPH_DECODE = _env_flag("GLMTTS_GRADIO_HF_GRAPH_DECODE", False)
-SERVICE_HF_GRAPH_MAX_CACHE_LEN = int(
+SERVICE_DEFAULT_HF_GRAPH_DECODE = _env_flag("GLMTTS_GRADIO_HF_GRAPH_DECODE", True)
+SERVICE_DEFAULT_HF_GRAPH_MAX_CACHE_LEN = int(
     os.environ.get("GLMTTS_GRADIO_HF_GRAPH_MAX_CACHE_LEN", "1536")
 )
-SERVICE_HF_GRAPH_WARMUP_ITERS = int(
+SERVICE_DEFAULT_HF_GRAPH_WARMUP_ITERS = int(
     os.environ.get("GLMTTS_GRADIO_HF_GRAPH_WARMUP_ITERS", "2")
 )
-SERVICE_SAMPLE_METHOD = os.environ.get("GLMTTS_GRADIO_SAMPLE_METHOD", "ras")
-SERVICE_SAMPLING_TOP_P = float(os.environ.get("GLMTTS_GRADIO_SAMPLE_TOP_P", "0.8"))
-SERVICE_SAMPLING_TOP_K = int(os.environ.get("GLMTTS_GRADIO_SAMPLE_TOP_K", "25"))
-SERVICE_SAMPLING_TEMPERATURE = float(
+SERVICE_DEFAULT_SAMPLE_METHOD = os.environ.get("GLMTTS_GRADIO_SAMPLE_METHOD", "ras")
+SERVICE_DEFAULT_SAMPLING_TOP_P = float(os.environ.get("GLMTTS_GRADIO_SAMPLE_TOP_P", "0.8"))
+SERVICE_DEFAULT_SAMPLING_TOP_K = int(os.environ.get("GLMTTS_GRADIO_SAMPLE_TOP_K", "25"))
+SERVICE_DEFAULT_SAMPLING_TEMPERATURE = float(
     os.environ.get("GLMTTS_GRADIO_SAMPLE_TEMPERATURE", "0.7")
 )
 
@@ -50,28 +50,55 @@ SERVICE_SAMPLING_TEMPERATURE = float(
 MODEL_CACHE = {
     "loaded": False,
     "sample_rate": None,
+    "config": None,
     "components": None,
 }
 
 
-def get_runtime_config():
-    return {
-        "hf_attn_implementation": SERVICE_HF_ATTN_IMPLEMENTATION,
-        "hf_graph_decode": SERVICE_HF_GRAPH_DECODE,
-        "hf_graph_max_cache_len": SERVICE_HF_GRAPH_MAX_CACHE_LEN,
-        "hf_graph_warmup_iters": SERVICE_HF_GRAPH_WARMUP_ITERS,
-        "sample_method": SERVICE_SAMPLE_METHOD,
-        "top_p": SERVICE_SAMPLING_TOP_P,
-        "top_k": SERVICE_SAMPLING_TOP_K,
-        "temperature": SERVICE_SAMPLING_TEMPERATURE,
+def get_runtime_config(llm_backend=None):
+    config = {
+        "llm_backend": SERVICE_DEFAULT_LLM_BACKEND,
+        "hf_attn_implementation": SERVICE_DEFAULT_HF_ATTN_IMPLEMENTATION,
+        "hf_graph_decode": SERVICE_DEFAULT_HF_GRAPH_DECODE,
+        "hf_graph_max_cache_len": SERVICE_DEFAULT_HF_GRAPH_MAX_CACHE_LEN,
+        "hf_graph_warmup_iters": SERVICE_DEFAULT_HF_GRAPH_WARMUP_ITERS,
+        "sample_method": SERVICE_DEFAULT_SAMPLE_METHOD,
+        "top_p": SERVICE_DEFAULT_SAMPLING_TOP_P,
+        "top_k": SERVICE_DEFAULT_SAMPLING_TOP_K,
+        "temperature": SERVICE_DEFAULT_SAMPLING_TEMPERATURE,
     }
+    if llm_backend is not None and str(llm_backend).strip():
+        config["llm_backend"] = str(llm_backend).strip().lower()
+
+    if config["llm_backend"] not in {"hf", "vllm"}:
+        raise ValueError(f"Unsupported llm_backend: {config['llm_backend']}")
+
+    if config["llm_backend"] == "hf":
+        if config["hf_graph_decode"] and not config["hf_attn_implementation"]:
+            config["hf_attn_implementation"] = "eager"
+    else:
+        config["hf_graph_decode"] = False
+        config["hf_attn_implementation"] = None
+
+    return config
 
 
-def get_models(use_phoneme=False, sample_rate=24000):
-    if MODEL_CACHE["loaded"] and MODEL_CACHE["sample_rate"] == sample_rate:
+def get_models(use_phoneme=False, sample_rate=24000, runtime_config=None):
+    runtime_config = runtime_config or get_runtime_config()
+    if (
+        MODEL_CACHE["loaded"]
+        and MODEL_CACHE["sample_rate"] == sample_rate
+        and MODEL_CACHE["config"] == runtime_config
+    ):
         return MODEL_CACHE["components"]
 
-    logging.info("Loading models with sample_rate=%s...", sample_rate)
+    logging.info(
+        "Loading models with sample_rate=%s backend=%s graph_decode=%s attn=%s...",
+        sample_rate,
+        runtime_config["llm_backend"],
+        runtime_config["hf_graph_decode"],
+        runtime_config["hf_attn_implementation"],
+    )
 
     if MODEL_CACHE["components"]:
         del MODEL_CACHE["components"]
@@ -81,10 +108,16 @@ def get_models(use_phoneme=False, sample_rate=24000):
     frontend, text_frontend, speech_tokenizer, llm, flow = load_models(
         use_phoneme=use_phoneme,
         sample_rate=sample_rate,
+        llm_backend=runtime_config["llm_backend"],
+        hf_attn_implementation=runtime_config["hf_attn_implementation"],
+        hf_graph_decode=runtime_config["hf_graph_decode"],
+        hf_graph_max_cache_len=runtime_config["hf_graph_max_cache_len"],
+        hf_graph_warmup_iters=runtime_config["hf_graph_warmup_iters"],
     )
 
     MODEL_CACHE["components"] = (frontend, text_frontend, speech_tokenizer, llm, flow)
     MODEL_CACHE["sample_rate"] = sample_rate
+    MODEL_CACHE["config"] = runtime_config
     MODEL_CACHE["loaded"] = True
     logging.info("Models loaded successfully.")
     return MODEL_CACHE["components"]
@@ -113,6 +146,7 @@ def audio_to_base64_wav(sample_rate, audio_int16):
 
 def format_status_text(result):
     return (
+        f"backend={result['config']['llm_backend']} "
         f"graph_decode={result['config']['hf_graph_decode']} "
         f"attn={result['config']['hf_attn_implementation']} | "
         f"elapsed={result['elapsed_seconds']:.3f}s "
@@ -121,15 +155,24 @@ def format_status_text(result):
     )
 
 
-def synthesize(prompt_text, prompt_audio_path, input_text, seed, sample_rate, use_cache=True):
+def synthesize(
+    prompt_text,
+    prompt_audio_path,
+    input_text,
+    seed,
+    sample_rate,
+    use_cache=True,
+    llm_backend=None,
+):
     if not input_text:
         raise ValueError("Please provide text to synthesize.")
     if not prompt_audio_path:
         raise ValueError("Please upload a prompt audio file.")
 
     start_time = time.perf_counter()
+    runtime_config = get_runtime_config(llm_backend=llm_backend)
     frontend, text_frontend, _, llm, flow = get_models(
-        use_phoneme=True, sample_rate=sample_rate
+        use_phoneme=True, sample_rate=sample_rate, runtime_config=runtime_config
     )
 
     normalized_input_text = text_frontend.text_normalize(input_text)
@@ -146,15 +189,15 @@ def synthesize(prompt_text, prompt_audio_path, input_text, seed, sample_rate, us
     logging.info("Normalized Input: %s", normalized_input_text)
     logging.info(
         "Shared inference config: backend=%s hf_attn_implementation=%s hf_graph_decode=%s hf_graph_max_cache_len=%s hf_graph_warmup_iters=%s sample_method=%s top_p=%s top_k=%s temperature=%s",
-        SERVICE_LLM_BACKEND,
-        SERVICE_HF_ATTN_IMPLEMENTATION,
-        SERVICE_HF_GRAPH_DECODE,
-        SERVICE_HF_GRAPH_MAX_CACHE_LEN,
-        SERVICE_HF_GRAPH_WARMUP_ITERS,
-        SERVICE_SAMPLE_METHOD,
-        SERVICE_SAMPLING_TOP_P,
-        SERVICE_SAMPLING_TOP_K,
-        SERVICE_SAMPLING_TEMPERATURE,
+        runtime_config["llm_backend"],
+        runtime_config["hf_attn_implementation"],
+        runtime_config["hf_graph_decode"],
+        runtime_config["hf_graph_max_cache_len"],
+        runtime_config["hf_graph_warmup_iters"],
+        runtime_config["sample_method"],
+        runtime_config["top_p"],
+        runtime_config["top_k"],
+        runtime_config["temperature"],
     )
 
     cache_speech_token_list = [
@@ -177,10 +220,10 @@ def synthesize(prompt_text, prompt_audio_path, input_text, seed, sample_rate, us
         embedding=prompt_entry["embedding"],
         flow_prompt_token=prompt_entry["flow_prompt_token"],
         speech_feat=prompt_entry["speech_feat"],
-        sample_method=SERVICE_SAMPLE_METHOD,
-        sampling_top_p=SERVICE_SAMPLING_TOP_P,
-        sampling_top_k=SERVICE_SAMPLING_TOP_K,
-        sampling_temperature=SERVICE_SAMPLING_TEMPERATURE,
+        sample_method=runtime_config["sample_method"],
+        sampling_top_p=runtime_config["top_p"],
+        sampling_top_k=runtime_config["top_k"],
+        sampling_temperature=runtime_config["temperature"],
         seed=seed,
         device=DEVICE,
         use_phoneme=False,
@@ -204,7 +247,7 @@ def synthesize(prompt_text, prompt_audio_path, input_text, seed, sample_rate, us
         "num_output_tokens": len(output_token_list),
         "text_tn_dict": text_tn_dict,
         "prompt_cache_size": len(PROMPT_CACHE),
-        "config": get_runtime_config(),
+        "config": runtime_config,
     }
 
 
@@ -226,6 +269,7 @@ def clear_memory():
     MODEL_CACHE["components"] = None
     MODEL_CACHE["loaded"] = False
     MODEL_CACHE["sample_rate"] = None
+    MODEL_CACHE["config"] = None
     PROMPT_CACHE.clear()
 
     gc.collect()

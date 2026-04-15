@@ -60,7 +60,7 @@ Ensure you use Python 3.10 - Python 3.12 versions.
 ### For NPU
 Obtain CANN image
 ```bash
-注：因为使用了vllm加速，首次生成音频需要录制静态图，耗时5min左右
+注：首次生成音频需要录制静态图，耗时5min左右
 # Update DEVICE according to your device (/dev/davinci[0-7])
 export DEVICE=/dev/davinci0
 # Update the vllm-ascend image
@@ -80,7 +80,6 @@ sudo docker run \
     -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
     -v /etc/ascend_install.info:/etc/ascend_install.info \
     -v $(pwd):/code \
-    -v /root/.cache:/root/.cache \
     -e ASCEND_VISIBLE_DEVICES=0 \
     -it $IMAGE bash
 ```
@@ -123,10 +122,10 @@ modelscope download --model ZhipuAI/GLM-TTS --local_dir ckpt
 
 ```bash
 python glmtts_inference.py \
-    --data=example_zh \
-    --exp_name=_test \
-    --llm_dtype bf16 \
-    --use_cache
+    --data example_zh \
+    --exp_name _hf_graph_buckets \
+    --llm_backend hf \
+    --hf_graph_decode
 ```
 
 #### Interactive Web Interface

@@ -183,6 +183,10 @@ class DiT(nn.Module):
             is_causal=False,
             spkr_emb_bd=None,
             block_pattern=None,
+            precomputed_text_embed=None,
+            precomputed_rope=None,
+            precomputed_attn_mask=None,
+            precomputed_padding_mask_b1t=None,
     ):
         """
         Forward pass of the DiT model.
@@ -198,26 +202,39 @@ class DiT(nn.Module):
             time_emb_bd = torch.cat([time_emb_bd, spkr_emb_bd], dim=-1)
 
         # 3. Text/Speech Token Embedding
-        text_embed = self.text_emb_layer(text, seq_len)
+        if precomputed_text_embed is None:
+            text_embed = self.text_emb_layer(text, seq_len)
+        else:
+            text_embed = precomputed_text_embed
 
         # 4. Input Concatenation & Projection
         middle_point_btd = self.emb_concator(middle_point_btd, condition_btd, text_embed, drop_audio_cond=False)
 
         # 5. Rotary Embeddings
-        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+        if precomputed_rope is None:
+            rope = self.rotary_embed.forward_from_seq_len(seq_len)
+        else:
+            rope = precomputed_rope
 
         # 6. Long Skip Connection (Save residual)
         if self.long_skip_connection is not None:
             residual = middle_point_btd
 
+        if precomputed_padding_mask_b1t is None:
+            padding_mask_b1t = padding_mask_bt.unsqueeze(1)
+        else:
+            padding_mask_b1t = precomputed_padding_mask_b1t
+
         # 7. Create Attention Mask
-        if is_causal:
+        if precomputed_attn_mask is not None:
+            attn_mask = precomputed_attn_mask
+        elif is_causal:
             # Default block pattern if None
             if block_pattern is None:
                 block_pattern = [25, 50, 200]
                 
             attn_mask = self.create_attn_mask(bs, seq_len,
-                                              padding_mask_bt.unsqueeze(1),
+                                              padding_mask_b1t,
                                               padding_mask_bt.device,
                                               n_heads=self.num_heads, 
                                               block_pattern=block_pattern)
@@ -227,7 +244,7 @@ class DiT(nn.Module):
         # 8. Transformer Blocks
         for block in self.transformer_blocks:
             middle_point_btd = block(middle_point_btd, time_emb_bd,
-                                     padding_mask=padding_mask_bt.unsqueeze(1),
+                                     padding_mask=padding_mask_b1t,
                                      rope=rope,
                                      attn_mask=attn_mask)
 

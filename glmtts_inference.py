@@ -58,7 +58,8 @@ from functools import partial
 from cosyvoice.cli.frontend import TTSFrontEnd, SpeechTokenizer, TextFrontEnd
 from utils import file_utils, seed_util
 from utils import tts_model_util, yaml_util
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, LlamaForCausalLM
+from transformers.cache_utils import StaticCache
 from llm.glmtts import GLMTTS
 from utils.audio import mel_spectrogram
 from vllm import LLM, SamplingParams
@@ -88,12 +89,13 @@ RAS_TOP_P = 0.8
 RAS_TOP_K = 25
 RAS_WIN_SIZE = 10
 RAS_TAU_R = 0.20
-RAS_TEMPERATURE = 1.0
+RAS_TEMPERATURE = 0.95
 
 # HF stepwise experiment params to compare against the vLLM path.
 HF_SAMPLE_TOP_P = 0.8
 HF_SAMPLE_TOP_K = 25
 HF_SAMPLE_TEMPERATURE = 0.7
+DEFAULT_HF_GRAPH_BUCKETS = "512,1024,1536"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -322,6 +324,468 @@ class VllmRasLogitsProcessor(AdapterLogitsProcessor):
         return ras_logits_processor
 
 
+def _hf_nucleus_sample(
+    weighted_scores: torch.Tensor,
+    top_p: float = HF_SAMPLE_TOP_P,
+    top_k: int = HF_SAMPLE_TOP_K,
+    temperature: float = HF_SAMPLE_TEMPERATURE,
+) -> torch.Tensor:
+    scaled_scores = weighted_scores.float() / temperature
+    sorted_value, sorted_idx = scaled_scores.softmax(dim=0).sort(
+        descending=True, stable=True
+    )
+    cum_probs = torch.cumsum(sorted_value, dim=0)
+    mask = (cum_probs - sorted_value) < top_p
+    if top_k < mask.shape[0]:
+        mask[top_k:] = False
+    if not mask.any():
+        mask[0] = True
+    prob = sorted_value[mask]
+    indices = sorted_idx[mask]
+    return indices[prob.multinomial(1, replacement=True)]
+
+
+def _build_full_input_ids(
+    llm, prompt_text_token, tts_text_token, prompt_speech_token, teacher_tokens
+):
+    prompt_speech_token_offset = prompt_speech_token + llm.ats
+    teacher_abs = [token + llm.ats for token in teacher_tokens]
+    return (
+        prompt_text_token.squeeze().tolist()
+        + tts_text_token.squeeze().tolist()
+        + [llm.boa]
+        + prompt_speech_token_offset.squeeze().tolist()
+        + teacher_abs
+    )
+
+
+class HFNpuGraphDecodeRunner:
+    def __init__(self, llm, max_cache_len=1536, warmup_iters=2):
+        self.llm = llm
+        self.max_cache_len = int(max_cache_len)
+        self.warmup_iters = max(1, int(warmup_iters))
+        self.device = llm.llama.model.embed_tokens.weight.device
+        self.embed_dtype = llm.llama.model.embed_tokens.weight.dtype
+        self.hidden_size = llm.llama.model.embed_tokens.weight.shape[1]
+        self.mask_fill_value = torch.finfo(self.embed_dtype).min
+        self.static_cache = StaticCache(
+            config=llm.llama.config,
+            max_cache_len=self.max_cache_len,
+        )
+        self.input_embeds_buf = torch.zeros(
+            (1, 1, self.hidden_size),
+            dtype=self.embed_dtype,
+            device=self.device,
+        )
+        self.attention_mask_buf = torch.full(
+            (1, 1, 1, self.max_cache_len),
+            self.mask_fill_value,
+            dtype=self.embed_dtype,
+            device=self.device,
+        )
+        self.cache_position_buf = torch.zeros((1,), dtype=torch.long, device=self.device)
+        self.position_ids_buf = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        self.token_id_buf = torch.zeros((1, 1), dtype=torch.long, device=self.device)
+        self.graphed_step = None
+        self.current_pos = 0
+        self._cache_initialized = False
+        self._graph_built = False
+
+    def can_handle(self, prefill_len: int, max_new_tokens: int) -> bool:
+        return (int(prefill_len) + int(max_new_tokens)) <= self.max_cache_len
+
+    def reset(self):
+        if self._cache_initialized:
+            self.static_cache.reset()
+        self.current_pos = 0
+
+    def _step_logits_impl(self, input_embeds):
+        position_embeddings = self.llm.llama.model.rotary_emb(
+            input_embeds, self.position_ids_buf
+        )
+        hidden_states = input_embeds
+        for decoder_layer in self.llm.llama.model.layers[
+            : self.llm.llama.model.config.num_hidden_layers
+        ]:
+            hidden_states = decoder_layer(
+                hidden_states,
+                attention_mask=self.attention_mask_buf,
+                position_ids=self.position_ids_buf,
+                past_key_values=self.static_cache,
+                cache_position=self.cache_position_buf,
+                position_embeddings=position_embeddings,
+            )
+        hidden_states = self.llm.llama.model.norm(hidden_states)
+        logits = self.llm.llama.lm_head(hidden_states)
+        return logits[:, -1, :]
+
+    @torch.inference_mode()
+    def _build_graph(self):
+        if self._graph_built:
+            return
+        logging.info(
+            "[hf_graph] building static single-step graph max_cache_len=%s warmup_iters=%s",
+            self.max_cache_len,
+            self.warmup_iters,
+        )
+        for _ in range(self.warmup_iters):
+            _ = self._step_logits_impl(self.input_embeds_buf)
+        torch.npu.synchronize()
+        self.graphed_step = torch.npu.make_graphed_callables(
+            self._step_logits_impl,
+            (self.input_embeds_buf,),
+            num_warmup_iters=self.warmup_iters,
+        )
+        torch.npu.synchronize()
+        self._graph_built = True
+
+    def prefill(self, full_input_ids):
+        self.reset()
+        self.attention_mask_buf.fill_(self.mask_fill_value)
+        prefill_len = len(full_input_ids)
+        self.attention_mask_buf[..., :prefill_len] = 0
+        input_tensor = torch.tensor([full_input_ids], dtype=torch.long, device=self.device)
+        inputs_embeds = self.llm.llama_embedding(input_tensor)
+        prefill_last_idx = torch.tensor([prefill_len - 1], dtype=torch.long, device=self.device)
+        outputs = self.llm.llama(
+            inputs_embeds=inputs_embeds,
+            past_key_values=self.static_cache,
+            use_cache=True,
+            logits_to_keep=prefill_last_idx,
+            return_dict=True,
+        )
+        self._cache_initialized = True
+        self.current_pos = int(input_tensor.shape[1])
+        return outputs.logits[0, -1].log_softmax(dim=-1)
+
+    def _prepare_step_buffers(self, sampled_abs_token: int):
+        self.token_id_buf[0, 0] = sampled_abs_token
+        self.input_embeds_buf.copy_(self.llm.llama_embedding(self.token_id_buf))
+        self.cache_position_buf[0] = self.current_pos
+        self.position_ids_buf[0, 0] = self.current_pos
+        self.attention_mask_buf[..., self.current_pos] = 0
+
+    def step(self, sampled_abs_token: int):
+        self._prepare_step_buffers(sampled_abs_token)
+        self._build_graph()
+        logits = self.graphed_step(self.input_embeds_buf)
+        self.current_pos += 1
+        return logits[0].log_softmax(dim=-1)
+
+    @torch.inference_mode()
+    def prime_graph(self):
+        if self._graph_built:
+            return
+        self.current_pos = 0
+        self.static_cache.reset()
+        self.attention_mask_buf.fill_(self.mask_fill_value)
+        self.cache_position_buf[0] = 0
+        self.position_ids_buf[0, 0] = 0
+        self.token_id_buf.zero_()
+        self.input_embeds_buf.copy_(self.llm.llama_embedding(self.token_id_buf))
+        self.attention_mask_buf[..., 0] = 0
+        self._build_graph()
+        self.static_cache.reset()
+        self.attention_mask_buf.fill_(self.mask_fill_value)
+        self.current_pos = 0
+        self._cache_initialized = False
+
+
+def _parse_hf_graph_buckets(hf_graph_buckets, fallback_max_cache_len):
+    if hf_graph_buckets is None:
+        buckets = []
+    elif isinstance(hf_graph_buckets, str):
+        buckets = [int(item.strip()) for item in hf_graph_buckets.split(",") if item.strip()]
+    else:
+        buckets = [int(item) for item in hf_graph_buckets]
+    buckets = [bucket for bucket in buckets if bucket > 0]
+    if fallback_max_cache_len is not None:
+        buckets.append(int(fallback_max_cache_len))
+    buckets = sorted(set(buckets))
+    if not buckets:
+        buckets = [1536]
+    return buckets
+
+
+def _select_hf_graph_bucket(llm, required_cache_len: int):
+    bucket_sizes = getattr(llm, "hf_graph_buckets", None) or [
+        getattr(llm, "hf_graph_max_cache_len", 1536)
+    ]
+    for bucket_size in bucket_sizes:
+        if int(required_cache_len) <= int(bucket_size):
+            return int(bucket_size)
+    return None
+
+
+def _maybe_get_hf_graph_runner(llm, required_cache_len: int | None = None):
+    if not getattr(llm, "hf_graph_decode", False):
+        return None
+    if getattr(llm, "inference_backend", None) != "hf":
+        return None
+    if not NPU_AVAILABLE or not hasattr(torch, "npu"):
+        logging.warning("[hf_graph] torch.npu is unavailable, fallback to eager decode")
+        llm.hf_graph_decode = False
+        return None
+    if not hasattr(torch.npu, "make_graphed_callables"):
+        logging.warning(
+            "[hf_graph] torch.npu.make_graphed_callables is unavailable, fallback to eager decode"
+        )
+        llm.hf_graph_decode = False
+        return None
+    if getattr(llm.llama.config, "_attn_implementation", None) != "eager":
+        logging.warning(
+            "[hf_graph] attn_implementation=%s is not graph-safe here; require eager, fallback to eager decode",
+            getattr(llm.llama.config, "_attn_implementation", None),
+        )
+        llm.hf_graph_decode = False
+        return None
+
+    if required_cache_len is None:
+        bucket_size = max(
+            getattr(llm, "hf_graph_buckets", None)
+            or [getattr(llm, "hf_graph_max_cache_len", 1536)]
+        )
+    else:
+        bucket_size = _select_hf_graph_bucket(llm, required_cache_len)
+        if bucket_size is None:
+            return None
+
+    runners = getattr(llm, "hf_graph_runners", None)
+    if runners is None:
+        runners = {}
+        llm.hf_graph_runners = runners
+
+    runner = runners.get(bucket_size)
+    if runner is None:
+        logging.info(
+            "[hf_graph] creating bucket runner max_cache_len=%s warmup_iters=%s",
+            bucket_size,
+            getattr(llm, "hf_graph_warmup_iters", 2),
+        )
+        runner = HFNpuGraphDecodeRunner(
+            llm=llm,
+            max_cache_len=bucket_size,
+            warmup_iters=getattr(llm, "hf_graph_warmup_iters", 2),
+        )
+        runners[bucket_size] = runner
+
+    llm.hf_graph_runner = runner
+    return runner
+
+
+def _maybe_prebuild_hf_graph_runners(llm):
+    if not getattr(llm, "hf_graph_decode", False):
+        return
+    if not getattr(llm, "hf_graph_prebuild_buckets", True):
+        logging.info("[hf_graph] skip bucket prebuild (disabled)")
+        return
+    bucket_sizes = getattr(llm, "hf_graph_buckets", None) or [
+        getattr(llm, "hf_graph_max_cache_len", 1536)
+    ]
+    logging.info("[hf_graph] prebuilding bucketed graph runners buckets=%s", bucket_sizes)
+    for bucket_size in bucket_sizes:
+        runner = _maybe_get_hf_graph_runner(llm, required_cache_len=bucket_size)
+        if runner is None:
+            return
+        with torch.inference_mode():
+            runner.prime_graph()
+
+
+@torch.inference_mode()
+def _hf_stepwise_forward_dynamic(
+    llm,
+    prompt_text_token,
+    tts_text_token,
+    prompt_speech_token,
+    beam_size=1,
+    sampling=25,
+    sample_method="nucleus",
+    sampling_top_p=HF_SAMPLE_TOP_P,
+    sampling_top_k=HF_SAMPLE_TOP_K,
+    sampling_temperature=HF_SAMPLE_TEMPERATURE,
+):
+    tts_text_token_len = _assert_shape_and_get_len(tts_text_token)
+    device = tts_text_token.device
+    prompt_speech_token = prompt_speech_token + llm.ats
+    boa_tensor = torch.tensor([llm.boa], device=device).unsqueeze(0)
+    input_ids = torch.cat(
+        [prompt_text_token, tts_text_token, boa_tensor, prompt_speech_token], dim=1
+    ).to(torch.long)
+    inputs_embeds = llm.llama_embedding(input_ids)
+
+    text_len = int(tts_text_token_len.item())
+    min_len = int(text_len * 2)
+    max_len = int(text_len * 20)
+
+    out_tokens = []
+    past_key_values = None
+
+    for i in range(max_len):
+        logits_to_keep = (
+            torch.tensor([inputs_embeds.shape[1] - 1], dtype=torch.long, device=device)
+            if inputs_embeds.shape[1] > 1
+            else 1
+        )
+        outputs = llm.llama(
+            inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values,
+            use_cache=True,
+            logits_to_keep=logits_to_keep,
+            return_dict=True,
+        )
+        past_key_values = outputs.past_key_values
+        logp = outputs.logits[0, -1].log_softmax(dim=-1)
+
+        if sample_method == "ras":
+            if i < min_len:
+                logp[llm.eoa] = -float("inf")
+            top_ids = llm.sampling_ids_ras(logp, out_tokens, sampling).item()
+        elif sample_method == "topk":
+            top_ids = llm.sampling_ids(
+                logp, sampling, beam_size, ignore_eos=(i < min_len)
+            ).item()
+        elif sample_method == "nucleus":
+            if i < min_len:
+                logp[llm.eoa] = -float("inf")
+            top_ids = _hf_nucleus_sample(
+                logp,
+                top_p=sampling_top_p,
+                top_k=sampling_top_k,
+                temperature=sampling_temperature,
+            ).item()
+        else:
+            raise ValueError(f"Unknown sample_method: {sample_method}")
+
+        if top_ids == llm.eoa:
+            break
+
+        out_tokens.append(top_ids)
+        inputs_embeds = llm.llama_embedding(
+            torch.tensor([[top_ids]], dtype=torch.long, device=device)
+        )
+
+    return [token_id - llm.ats for token_id in out_tokens]
+
+
+@torch.inference_mode()
+def _hf_stepwise_forward_static_graph(
+    llm,
+    prompt_text_token,
+    tts_text_token,
+    prompt_speech_token,
+    beam_size=1,
+    sampling=25,
+    sample_method="nucleus",
+    sampling_top_p=HF_SAMPLE_TOP_P,
+    sampling_top_k=HF_SAMPLE_TOP_K,
+    sampling_temperature=HF_SAMPLE_TEMPERATURE,
+):
+    tts_text_token_len = _assert_shape_and_get_len(tts_text_token)
+    text_len = int(tts_text_token_len.item())
+    min_len = int(text_len * 2)
+    max_len = int(text_len * 20)
+    full_input_ids = _build_full_input_ids(
+        llm, prompt_text_token, tts_text_token, prompt_speech_token, []
+    )
+    required_cache_len = len(full_input_ids) + max_len
+    runner = _maybe_get_hf_graph_runner(llm, required_cache_len=required_cache_len)
+    if runner is None:
+        logging.info(
+            "[hf_graph] fallback to eager: required_cache_len=%s has no matching bucket in buckets=%s",
+            required_cache_len,
+            getattr(llm, "hf_graph_buckets", None),
+        )
+        return None
+    if not runner.can_handle(len(full_input_ids), max_len):
+        logging.info(
+            "[hf_graph] fallback to eager: required_cache_len=%s > max_cache_len=%s. Chunking shorter text can reduce this pressure.",
+            required_cache_len,
+            runner.max_cache_len,
+        )
+        return None
+
+    logging.info(
+        "[hf_graph] selected bucket max_cache_len=%s required_cache_len=%s prefill_len=%s max_new_tokens=%s",
+        runner.max_cache_len,
+        required_cache_len,
+        len(full_input_ids),
+        max_len,
+    )
+
+    logp = runner.prefill(full_input_ids)
+    out_tokens = []
+
+    for i in range(max_len):
+        if sample_method == "ras":
+            if i < min_len:
+                logp[llm.eoa] = -float("inf")
+            top_ids = llm.sampling_ids_ras(logp, out_tokens, sampling).item()
+        elif sample_method == "topk":
+            top_ids = llm.sampling_ids(
+                logp, sampling, beam_size, ignore_eos=(i < min_len)
+            ).item()
+        elif sample_method == "nucleus":
+            if i < min_len:
+                logp[llm.eoa] = -float("inf")
+            top_ids = _hf_nucleus_sample(
+                logp,
+                top_p=sampling_top_p,
+                top_k=sampling_top_k,
+                temperature=sampling_temperature,
+            ).item()
+        else:
+            raise ValueError(f"Unknown sample_method: {sample_method}")
+
+        if top_ids == llm.eoa:
+            break
+
+        out_tokens.append(top_ids)
+        logp = runner.step(top_ids)
+
+    return [token_id - llm.ats for token_id in out_tokens]
+
+
+@torch.inference_mode()
+def _hf_stepwise_forward(
+    llm,
+    prompt_text_token,
+    tts_text_token,
+    prompt_speech_token,
+    beam_size=1,
+    sampling=25,
+    sample_method="nucleus",
+    sampling_top_p=HF_SAMPLE_TOP_P,
+    sampling_top_k=HF_SAMPLE_TOP_K,
+    sampling_temperature=HF_SAMPLE_TEMPERATURE,
+):
+    graph_res = _hf_stepwise_forward_static_graph(
+        llm=llm,
+        prompt_text_token=prompt_text_token,
+        tts_text_token=tts_text_token,
+        prompt_speech_token=prompt_speech_token,
+        beam_size=beam_size,
+        sampling=sampling,
+        sample_method=sample_method,
+        sampling_top_p=sampling_top_p,
+        sampling_top_k=sampling_top_k,
+        sampling_temperature=sampling_temperature,
+    )
+    if graph_res is not None:
+        return graph_res
+    return _hf_stepwise_forward_dynamic(
+        llm=llm,
+        prompt_text_token=prompt_text_token,
+        tts_text_token=tts_text_token,
+        prompt_speech_token=prompt_speech_token,
+        beam_size=beam_size,
+        sampling=sampling,
+        sample_method=sample_method,
+        sampling_top_p=sampling_top_p,
+        sampling_top_k=sampling_top_k,
+        sampling_temperature=sampling_temperature,
+    )
+
+
 def local_llm_forward(
     llm,
     prompt_text_token,
@@ -335,9 +799,20 @@ def local_llm_forward(
     sampling_temperature=HF_SAMPLE_TEMPERATURE,
     seed=0,
 ):
-    """
-    Single LLM forward pass.
-    """
+    if getattr(llm, "inference_backend", "hf") == "hf":
+        return _hf_stepwise_forward(
+            llm=llm,
+            prompt_text_token=prompt_text_token,
+            tts_text_token=tts_text_token,
+            prompt_speech_token=prompt_speech_token,
+            beam_size=beam_size,
+            sampling=sampling,
+            sample_method=sample_method,
+            sampling_top_p=sampling_top_p,
+            sampling_top_k=sampling_top_k,
+            sampling_temperature=sampling_temperature,
+        )
+
     prompt_speech_token_offset = prompt_speech_token + llm.ats
     input_ids = (
         prompt_text_token.squeeze().tolist()
@@ -405,7 +880,7 @@ def local_flow_forward(flow, token_list, prompt_speech_tokens, speech_feat, embe
         prompt_feat=speech_feat,
         embedding=embedding,
     )
-    return wav.detach().cpu(), full_mel
+    return wav.detach(), full_mel
 
 
 def get_prompt_cache_entry(
@@ -755,6 +1230,13 @@ def load_models(
     use_phoneme=False,
     sample_rate=24000,
     llm_dtype="bf16",
+    llm_backend="hf",
+    hf_attn_implementation=None,
+    hf_graph_decode=True,
+    hf_graph_max_cache_len=1536,
+    hf_graph_warmup_iters=2,
+    hf_graph_buckets=DEFAULT_HF_GRAPH_BUCKETS,
+    hf_graph_prebuild_buckets=True,
 ):
     load_models_start = time.perf_counter()
 
@@ -781,30 +1263,74 @@ def load_models(
 
     llm_start = time.perf_counter()
     llm = GLMTTS(llama_cfg_path=os.path.join(llama_path, "config.json"), mode="PRETRAIN")
-    llm.inference_backend = "vllm"
-
-    logging.info("🚀 Initializing vLLM Engine")
-    logging.info(f"📂 Model: {llama_path}")
-    logging.info(f"🎫 Tokenizer: {tokenizer_path}")
-
-    llm.vllm_engine = LLM(
-        model=llama_path,
-        tokenizer=tokenizer_path,
-        trust_remote_code=True,
-        tensor_parallel_size=1,
-        dtype="bfloat16",
-        gpu_memory_utilization=0.6,
-        enforce_eager=False,
-        max_model_len=1024,
-        block_size=128,
-        disable_log_stats=True,
-        logits_processors=[VllmRasLogitsProcessor],
+    llm.inference_backend = llm_backend
+    llm.hf_graph_decode = bool(hf_graph_decode)
+    llm.hf_graph_buckets = _parse_hf_graph_buckets(
+        hf_graph_buckets, hf_graph_max_cache_len
     )
-    llm.llama = None
-    logging.info("✅ vLLM Engine is Ready!")
+    llm.hf_graph_max_cache_len = max(llm.hf_graph_buckets)
+    llm.hf_graph_warmup_iters = int(hf_graph_warmup_iters)
+    llm.hf_graph_prebuild_buckets = bool(hf_graph_prebuild_buckets)
+    llm.hf_graph_runners = {}
+    llm.hf_graph_runner = None
+
+    if llm_backend == "vllm":
+        logging.info("Initializing vLLM Engine")
+        logging.info(f"Model: {llama_path}")
+        logging.info(f"Tokenizer: {tokenizer_path}")
+        llm.vllm_engine = LLM(
+            model=llama_path,
+            tokenizer=tokenizer_path,
+            trust_remote_code=True,
+            tensor_parallel_size=1,
+            dtype="bfloat16",
+            gpu_memory_utilization=0.6,
+            enforce_eager=False,
+            max_model_len=1024,
+            block_size=128,
+            disable_log_stats=True,
+            logits_processors=[VllmRasLogitsProcessor],
+        )
+        llm.llama = None
+        logging.info("vLLM Engine is Ready!")
+    elif llm_backend == "hf":
+        if llm.hf_graph_decode and hf_attn_implementation is None:
+            hf_attn_implementation = "eager"
+            logging.info(
+                "[hf_graph] auto-set hf_attn_implementation=eager for static decode graph"
+            )
+        dtype_map = {
+            "bf16": torch.bfloat16,
+            "fp16": torch.float16,
+            "fp32": torch.float32,
+        }
+        target_dtype = dtype_map.get(llm_dtype, torch.bfloat16)
+        logging.info("Initializing HF stepwise LLM")
+        logging.info(f"Model: {llama_path}")
+        llm.llama = LlamaForCausalLM.from_pretrained(
+            llama_path,
+            torch_dtype=target_dtype,
+            low_cpu_mem_usage=True,
+            trust_remote_code=True,
+        ).to(DEVICE)
+        if hf_attn_implementation:
+            llm.llama.config._attn_implementation = hf_attn_implementation
+            for layer in llm.llama.model.layers:
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
+                    layer.self_attn.config._attn_implementation = hf_attn_implementation
+        llm.llama.eval()
+        llm.llama_embedding = llm.llama.model.embed_tokens
+        llm.vllm_engine = None
+        logging.info(
+            "HF stepwise LLM is Ready! attn_implementation=%s",
+            getattr(llm.llama.config, "_attn_implementation", None),
+        )
+    else:
+        raise ValueError(f"Unsupported llm_backend: {llm_backend}")
 
     special_token_ids = get_special_token_ids(frontend.tokenize_fn)
     llm.set_runtime_vars(special_token_ids=special_token_ids)
+    _maybe_prebuild_hf_graph_runners(llm)
 
     flow_ckpt = os.path.join("ckpt", "flow", "flow.pt")
     flow_config = os.path.join("ckpt", "flow", "config.yaml")
@@ -836,6 +1362,21 @@ if __name__ == "__main__":
         choices=["fp32", "bf16", "fp16", "int8"],
         help="LLM dtype",
     )
+    parser.add_argument("--llm_backend", default="hf", choices=["vllm", "hf"])
+    parser.add_argument("--hf_attn_implementation", default=None, choices=["eager", "sdpa"])
+    parser.add_argument(
+        "--hf_graph_decode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--hf_graph_max_cache_len", type=int, default=1536)
+    parser.add_argument("--hf_graph_warmup_iters", type=int, default=2)
+    parser.add_argument("--hf_graph_buckets", type=str, default=DEFAULT_HF_GRAPH_BUCKETS)
+    parser.add_argument(
+        "--hf_graph_prebuild_buckets",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--sample_method", default="ras", choices=["ras", "topk", "nucleus"])
     parser.add_argument("--sampling_top_p", type=float, default=HF_SAMPLE_TOP_P)
     parser.add_argument("--sampling_top_k", type=int, default=HF_SAMPLE_TOP_K)
@@ -845,12 +1386,30 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # Load Models
+    set_npu_jit(False)
+    os.environ["ACL_OP_COMPILER_CACHE_MODE"] = "enable"
+    cache_dir = os.path.join(CURRENT_DIR, "npu_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["ACL_OP_COMPILER_CACHE_DIR"] = cache_dir
+
     main_start = time.perf_counter()
+    logging.info(
+        f"[main] start data={args.data} exp_name={args.exp_name} sample_rate={args.sample_rate} "
+        f"use_cache={args.use_cache} use_phoneme={args.use_phoneme} device={DEVICE} "
+        f"llm_backend={args.llm_backend} hf_graph_decode={args.hf_graph_decode} "
+        f"hf_graph_buckets={args.hf_graph_buckets} sample_method={args.sample_method}"
+    )
     frontend, text_frontend, speech_tokenizer, llm, flow = load_models(
         use_phoneme=args.use_phoneme,
         sample_rate=args.sample_rate,
         llm_dtype=args.llm_dtype,
+        llm_backend=args.llm_backend,
+        hf_attn_implementation=args.hf_attn_implementation,
+        hf_graph_decode=args.hf_graph_decode,
+        hf_graph_max_cache_len=args.hf_graph_max_cache_len,
+        hf_graph_warmup_iters=args.hf_graph_warmup_iters,
+        hf_graph_buckets=args.hf_graph_buckets,
+        hf_graph_prebuild_buckets=args.hf_graph_prebuild_buckets,
     )
 
     # Create Output Directory

@@ -213,18 +213,7 @@ class Flow(torch.nn.Module):
                 "x": x.clone().detach(),
             }
 
-            # 1. Forward pass (Conditional)
-            dphi_dt = self.estimator(
-                middle_point_btd=x,
-                condition_btd=condition_btd,
-                text=speech_token_bt,
-                time_step_1d=t_current[None],
-                padding_mask_bt=padding_mask_bt,
-                spkr_emb_bd=spkr_embedding_normed,
-                is_causal=is_causal,
-                block_pattern=block_pattern
-            )
-
+            # 1. Forward pass + optional CFG
             # 2. Classifier-Free Guidance (CFG)
             if self.inference_cfg_rate > 0:
                 # Prepare unconditional input
@@ -233,21 +222,56 @@ class Flow(torch.nn.Module):
                 else:
                     text_for_no_condition = speech_token_bt
 
-                # Forward pass (Unconditional)
-                cfg_dphi_dt = self.estimator(
+                # Batch the conditional and unconditional passes together.
+                x_batched = torch.cat([x, x], dim=0)
+                condition_batched = torch.cat(
+                    [condition_btd, torch.zeros_like(condition_btd)],
+                    dim=0,
+                )
+                text_batched = torch.cat(
+                    [speech_token_bt, text_for_no_condition],
+                    dim=0,
+                )
+                time_batched = t_current[None].repeat(2)
+                padding_mask_batched = torch.cat(
+                    [padding_mask_bt, padding_mask_bt],
+                    dim=0,
+                )
+                spkr_emb_batched = torch.cat(
+                    [
+                        spkr_embedding_normed,
+                        torch.zeros_like(spkr_embedding_normed),
+                    ],
+                    dim=0,
+                )
+
+                dphi_all = self.estimator(
+                    middle_point_btd=x_batched,
+                    condition_btd=condition_batched,
+                    text=text_batched,
+                    time_step_1d=time_batched,
+                    padding_mask_bt=padding_mask_batched,
+                    spkr_emb_bd=spkr_emb_batched,
+                    is_causal=is_causal,
+                    block_pattern=block_pattern,
+                )
+
+                dphi_dt, cfg_dphi_dt = dphi_all.chunk(2, dim=0)
+                dphi_dt = (
+                    (1.0 + self.inference_cfg_rate) * dphi_dt
+                    - self.inference_cfg_rate * cfg_dphi_dt
+                )
+            else:
+                dphi_dt = self.estimator(
                     middle_point_btd=x,
-                    condition_btd=torch.zeros_like(condition_btd),
-                    text=text_for_no_condition,
+                    condition_btd=condition_btd,
+                    text=speech_token_bt,
                     time_step_1d=t_current[None],
                     padding_mask_bt=padding_mask_bt,
-                    spkr_emb_bd=torch.zeros_like(spkr_embedding_normed),
+                    spkr_emb_bd=spkr_embedding_normed,
                     is_causal=is_causal,
-                    block_pattern=block_pattern
+                    block_pattern=block_pattern,
                 )
-                
-                # Combine conditional and unconditional outputs
-                dphi_dt = ((1.0 + self.inference_cfg_rate) * dphi_dt - 
-                           self.inference_cfg_rate * cfg_dphi_dt)
 
             # Euler Step
             x = x + dt * dphi_dt
