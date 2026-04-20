@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import tempfile
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -205,6 +206,15 @@ def _get_voice_document(voice_id: str):
     return doc
 
 
+def _voice_exists(voice_id: str):
+    collection = _try_get_voice_collection()
+    if collection is not None:
+        return collection.find_one({"_id": voice_id}, {"_id": 1}) is not None
+
+    voice_index = _read_voice_index()
+    return voice_id in voice_index
+
+
 def _save_voice_document(doc):
     collection = _try_get_voice_collection()
     if collection is not None:
@@ -266,6 +276,7 @@ async def clone_voice_endpoint(
     request: Request,
     prompt_text: str = Form(...),
     reference_audio_path: str | None = Form(None),
+    voice_id: str | None = Form(None),
     voice_name: str = Form(""),
     reference_audio: UploadFile | None = File(None),
 ):
@@ -273,17 +284,23 @@ async def clone_voice_endpoint(
     if not prompt_text:
         raise HTTPException(status_code=400, detail="prompt_text is required.")
 
-    voice_id = uuid4().hex
+    requested_voice_id = (voice_id or "").strip() or uuid4().hex
+    if _voice_exists(requested_voice_id):
+        raise HTTPException(
+            status_code=409,
+            detail=f"voice_id already exists: {requested_voice_id}",
+        )
+
     saved_audio_path, relative_audio_path = await _materialize_clone_audio(
         reference_audio=reference_audio,
         reference_audio_path=reference_audio_path,
-        voice_id=voice_id,
+        voice_id=requested_voice_id,
     )
 
     now_iso = _utc_now_iso()
     doc = {
-        "_id": voice_id,
-        "voice_id": voice_id,
+        "_id": requested_voice_id,
+        "voice_id": requested_voice_id,
         "voice_name": voice_name.strip(),
         "prompt_text": prompt_text,
         "reference_audio_path": str(saved_audio_path),
@@ -297,7 +314,7 @@ async def clone_voice_endpoint(
     return JSONResponse(
         content=_success_payload(
             {
-                "voice_id": voice_id,
+                "voice_id": requested_voice_id,
                 "voice_name": doc["voice_name"],
                 "prompt_text": prompt_text,
                 "reference_audio_url": doc["reference_audio_url"],
@@ -311,6 +328,7 @@ async def clone_voice_endpoint(
 async def generate_tts_endpoint(
     payload: GenerateTTSRequest,
 ):
+    endpoint_start = time.perf_counter()
     voice_id = payload.voice_id.strip()
     input_text = payload.input_text.strip()
     if not voice_id:
@@ -318,7 +336,9 @@ async def generate_tts_endpoint(
     if not input_text:
         raise HTTPException(status_code=400, detail="input_text is required.")
 
+    voice_lookup_start = time.perf_counter()
     voice_doc = _get_voice_document(voice_id)
+    voice_lookup_seconds = time.perf_counter() - voice_lookup_start
 
     try:
         result = synthesize(
@@ -334,13 +354,21 @@ async def generate_tts_endpoint(
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     status_text = format_status_text(result)
+    wav_pack_start = time.perf_counter()
     wav_bytes = audio_to_wav_bytes(result["sample_rate"], result["audio_int16"])
+    wav_pack_seconds = time.perf_counter() - wav_pack_start
+    endpoint_total_seconds = time.perf_counter() - endpoint_start
+    endpoint_overhead_seconds = endpoint_total_seconds - result["elapsed_seconds"]
     headers = {
         "X-Voice-Id": voice_id,
         "X-Elapsed-Seconds": f"{result['elapsed_seconds']:.6f}",
         "X-Audio-Seconds": f"{result['audio_seconds']:.6f}",
         "X-RTF": f"{result['rtf']:.6f}",
         "X-Status-Text": status_text,
+        "X-Voice-Lookup-Seconds": f"{voice_lookup_seconds:.6f}",
+        "X-Wav-Pack-Seconds": f"{wav_pack_seconds:.6f}",
+        "X-Endpoint-Total-Seconds": f"{endpoint_total_seconds:.6f}",
+        "X-Endpoint-Overhead-Seconds": f"{endpoint_overhead_seconds:.6f}",
     }
 
     return Response(

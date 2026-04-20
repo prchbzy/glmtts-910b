@@ -66,7 +66,9 @@ export DEVICE=/dev/davinci0
 # Update the vllm-ascend image
 sudo docker pull uhub.service.ucloud.cn/live/glm-tts-ascend-vllm:0408
 export IMAGE=uhub.service.ucloud.cn/live/glm-tts-ascend-vllm:0408
+sudo docker network create glmtts-net
 sudo docker run \
+    --network glmtts-net \
     --name glmtts-vllm-td-0408 \
     -p 8048:8048 \
     --shm-size=16g \
@@ -132,6 +134,64 @@ python glmtts_inference.py \
 
 ```bash
 python -m tools.gradio_app
+```
+
+#### Interactive API
+
+```bash
+# [Step 0] start mongo
+sudo docker run -d \
+  --network glmtts-net \
+  --name glmtts-mongo \
+  -e MONGO_INITDB_ROOT_USERNAME=root \
+  -e MONGO_INITDB_ROOT_PASSWORD='123456' \
+  -v /tmp/mongo_data:/data/db \
+  -p 27017:27017 \
+  --restart unless-stopped \
+  mongo:7
+
+# Launch the backend service on your NPU 910B environment
+./glmtts_api.sh
+
+# [Step 1] Clone
+# Description: Register a voice by uploading a reference audio (3-10s). 
+# The system extracts timbre features and saves them to the local index.
+# Note: This endpoint is for testing purposes only.
+# Request:
+curl --location 'http://10.2.0.84:8048/voices/clone'     
+--form 'voice_id="jiayan"'     
+--form 'prompt_text="他当时还跟线下其他的站姐吵架，然后，打架进局子了。"'     
+--form 'reference_audio=@"/data/dihum/dcx/glm-tts/examples/prompt/jiayan_zh.wav"'
+
+# Response:
+{"code":0,"message":"success","data":{"voice_id":"jiayan","voice_name":"","prompt_text":"他当 时还跟线下其他的站姐吵架，然后，打架进局子了。","reference_audio_url":"http://10.2.0.84:8048/files/voices/jiayan/reference.wav","storage_backend":"mongo"}}
+
+#[Step 2] TTS Generation
+# Description: Generate speech using a registered voice_id. 
+# The API returns a binary WAV stream and embeds performance metrics in HTTP headers.
+# Note: Synchronous generation. The first request (cold start/graph compilation) 
+# may take approximately 5 minutes to return.
+# Request:
+sudo curl --location 'http://10.2.0.84:8049/tts/generate' --header 'Content-Type: application/json' --data '{
+    "voice_id": "jiayan",
+    "input_text": "今天天气好"
+}' -o test.wav --dump-header info.txt
+
+# Metric Analysis (cat info.txt):
+HTTP/1.1 200 OK
+date: Mon, 20 Apr 2026 06:36:01 GMT
+server: uvicorn
+x-voice-id: jiayan
+x-elapsed-seconds: 1.239744
+x-audio-seconds: 1.580000
+x-rtf: 0.784648
+x-status-text: backend=hf graph_decode=True attn=eager | elapsed=1.240s audio=1.580s rtf=0.7846
+x-voice-lookup-seconds: 0.001331
+x-wav-pack-seconds: 0.000114
+x-endpoint-total-seconds: 1.241698
+x-endpoint-overhead-seconds: 0.001954
+content-length: 75884
+content-type: audio/wav
 ```
 
 ## System Architecture
