@@ -198,6 +198,9 @@ x-endpoint-total-seconds: 1.241698
 x-endpoint-overhead-seconds: 0.001954
 content-length: 75884
 content-type: audio/wav
+
+# 4. [第三步] 测试脚本
+python test.py
 ```
 
 ## 系统架构

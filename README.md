@@ -192,6 +192,9 @@ x-endpoint-total-seconds: 1.241698
 x-endpoint-overhead-seconds: 0.001954
 content-length: 75884
 content-type: audio/wav
+
+#[Step 3] TTS tesh script
+python test.py
 ```
 
 ## System Architecture
