@@ -200,7 +200,7 @@ content-length: 75884
 content-type: audio/wav
 
 # 4. [第三步] 测试脚本
-python test.py
+python test_api.py
 ```
 
 ## 系统架构

@@ -194,7 +194,7 @@ content-length: 75884
 content-type: audio/wav
 
 #[Step 3] TTS tesh script
-python test.py
+python test_api.py
 ```
 
 ## System Architecture
