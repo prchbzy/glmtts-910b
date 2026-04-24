@@ -129,9 +129,10 @@ class Flow(torch.nn.Module):
 
         # Process Speaker Embedding
         spkr_embedding_normed = F.normalize(embedding, dim=1)
+        spk_proj_dtype = self.spk_embed_affine_layer.weight.dtype if not self.remove_spkr_concat_condition else spkr_embedding_normed.dtype
 
         if not self.remove_spkr_concat_condition:
-            spkr_embedding = self.spk_embed_affine_layer(spkr_embedding_normed)
+            spkr_embedding = self.spk_embed_affine_layer(spkr_embedding_normed.to(dtype=spk_proj_dtype))
             # Expand speaker embedding to match time dimension
             spkr_embedding_expanded = spkr_embedding.unsqueeze(1).expand(-1, mel_cond_btd.shape[1], -1)
             # Concatenate mel-condition and speaker-condition
@@ -181,108 +182,165 @@ class Flow(torch.nn.Module):
         step-by-step caching for streaming.
         """
         current_step2cache = {}
-        
-        # Initial noise
-        x = torch.randn_like(mel_cond_btd)
-        device = speech_token_bt.device
 
-        # Time scheduler setup
+        estimator_dtype = next(self.estimator.parameters()).dtype
+        x = torch.randn_like(mel_cond_btd, dtype=estimator_dtype)
+        condition_btd = condition_btd.to(dtype=estimator_dtype)
+        spkr_embedding_normed = spkr_embedding_normed.to(dtype=estimator_dtype)
+        device = speech_token_bt.device
+        om_manager = getattr(self, 'om_estimator_manager', None)
+        om_manager_initialized = getattr(self, 'om_estimator_manager_initialized', False)
+
         t_span = torch.linspace(0, 1, n_timesteps + 1, device=device)
         if self.t_scheduler == 'cosine':
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        # Note: If other schedulers are needed, add elif blocks here.
 
         t_current = t_span[0]
         dt = t_span[1] - t_span[0]
 
-        sol = []
-        
-        # Iterative Denoising (Euler method)
+        seq_len = x.shape[1]
+        om_text_embed = None
+        om_text_embed_uncond = None
+        if not om_manager_initialized:
+            try:
+                om_text_embed = self.estimator.text_emb_layer(speech_token_bt, seq_len)
+                if self.inference_cfg_rate > 0 and self.speech_token_cfg:
+                    text_for_no_condition = torch.zeros_like(speech_token_bt)
+                    om_text_embed_uncond = self.estimator.text_emb_layer(text_for_no_condition, seq_len)
+            except Exception as prep_err:
+                print(f'[flow_om] text embed precompute failed before om init: {prep_err}')
+
+        if om_manager is None and not om_manager_initialized:
+            from flow.om_runtime import maybe_create_flow_om_manager
+            om_manager = maybe_create_flow_om_manager()
+            self.om_estimator_manager = om_manager
+            self.om_estimator_manager_initialized = True
+
+        if om_manager is not None:
+            try:
+                chosen_bucket = om_manager.select_bucket(seq_len)
+                print(
+                    f'[flow_om] request seq_len={seq_len} bucket={chosen_bucket} '
+                    f'timesteps={n_timesteps} cfg={self.inference_cfg_rate > 0}'
+                )
+                if om_text_embed is None:
+                    om_text_embed = self.estimator.text_emb_layer(speech_token_bt, seq_len)
+                    if self.inference_cfg_rate > 0 and self.speech_token_cfg:
+                        text_for_no_condition = torch.zeros_like(speech_token_bt)
+                        om_text_embed_uncond = self.estimator.text_emb_layer(text_for_no_condition, seq_len)
+            except Exception as bucket_err:
+                print(f'[flow_om] prepare failed, fallback to PyTorch: {bucket_err}')
+                om_manager = None
+
         for step in range(1, len(t_span)):
-            # Apply cache if available (Overwriting the beginning of the sequence)
             if last_step_cache is not None:
                 x_cache = last_step_cache[step]['x']
                 override_len = last_step_cache.get('override_len', x_cache.shape[-1])
-                
-                # Safety check for dimensions
                 safe_len = min(x.shape[1], override_len)
                 x[:, :safe_len, :] = x_cache[:, :safe_len, :]
 
-            # Cache current input for the next streaming chunk
             current_step2cache[step] = {
                 "x": x.clone().detach(),
             }
 
-            # 1. Forward pass + optional CFG
-            # 2. Classifier-Free Guidance (CFG)
-            if self.inference_cfg_rate > 0:
-                # Prepare unconditional input
-                if self.speech_token_cfg:
-                    text_for_no_condition = torch.zeros_like(speech_token_bt)
+            if om_manager is not None:
+                try:
+                    if self.inference_cfg_rate > 0:
+                        cond_out = om_manager.infer(
+                            middle_point_btd=x,
+                            condition_btd=condition_btd,
+                            precomputed_text_embed=om_text_embed,
+                            time_step_1d=t_current[None],
+                            padding_mask_bt=padding_mask_bt,
+                            spkr_emb_bd=spkr_embedding_normed,
+                        )
+                        uncond_text_embed = om_text_embed_uncond if self.speech_token_cfg else om_text_embed
+                        cfg_out = om_manager.infer(
+                            middle_point_btd=x,
+                            condition_btd=torch.zeros_like(condition_btd),
+                            precomputed_text_embed=uncond_text_embed,
+                            time_step_1d=t_current[None],
+                            padding_mask_bt=padding_mask_bt,
+                            spkr_emb_bd=torch.zeros_like(spkr_embedding_normed),
+                        )
+                        dphi_dt = (
+                            (1.0 + self.inference_cfg_rate) * cond_out
+                            - self.inference_cfg_rate * cfg_out
+                        )
+                    else:
+                        dphi_dt = om_manager.infer(
+                            middle_point_btd=x,
+                            condition_btd=condition_btd,
+                            precomputed_text_embed=om_text_embed,
+                            time_step_1d=t_current[None],
+                            padding_mask_bt=padding_mask_bt,
+                            spkr_emb_bd=spkr_embedding_normed,
+                        )
+                except Exception as om_err:
+                    print(f'[flow_om] infer failed, fallback to PyTorch: {om_err}')
+                    om_manager = None
+
+            if om_manager is None:
+                if self.inference_cfg_rate > 0:
+                    if self.speech_token_cfg:
+                        text_for_no_condition = torch.zeros_like(speech_token_bt)
+                    else:
+                        text_for_no_condition = speech_token_bt
+
+                    x_batched = torch.cat([x, x], dim=0)
+                    condition_batched = torch.cat(
+                        [condition_btd, torch.zeros_like(condition_btd)],
+                        dim=0,
+                    )
+                    text_batched = torch.cat(
+                        [speech_token_bt, text_for_no_condition],
+                        dim=0,
+                    )
+                    time_batched = t_current[None].repeat(2)
+                    padding_mask_batched = torch.cat(
+                        [padding_mask_bt, padding_mask_bt],
+                        dim=0,
+                    )
+                    spkr_emb_batched = torch.cat(
+                        [
+                            spkr_embedding_normed,
+                            torch.zeros_like(spkr_embedding_normed),
+                        ],
+                        dim=0,
+                    )
+
+                    dphi_all = self.estimator(
+                        middle_point_btd=x_batched,
+                        condition_btd=condition_batched,
+                        text=text_batched,
+                        time_step_1d=time_batched,
+                        padding_mask_bt=padding_mask_batched,
+                        spkr_emb_bd=spkr_emb_batched,
+                        is_causal=is_causal,
+                        block_pattern=block_pattern,
+                    )
+
+                    dphi_dt, cfg_dphi_dt = dphi_all.chunk(2, dim=0)
+                    dphi_dt = (
+                        (1.0 + self.inference_cfg_rate) * dphi_dt
+                        - self.inference_cfg_rate * cfg_dphi_dt
+                    )
                 else:
-                    text_for_no_condition = speech_token_bt
+                    dphi_dt = self.estimator(
+                        middle_point_btd=x,
+                        condition_btd=condition_btd,
+                        text=speech_token_bt,
+                        time_step_1d=t_current[None],
+                        padding_mask_bt=padding_mask_bt,
+                        spkr_emb_bd=spkr_embedding_normed,
+                        is_causal=is_causal,
+                        block_pattern=block_pattern,
+                    )
 
-                # Batch the conditional and unconditional passes together.
-                x_batched = torch.cat([x, x], dim=0)
-                condition_batched = torch.cat(
-                    [condition_btd, torch.zeros_like(condition_btd)],
-                    dim=0,
-                )
-                text_batched = torch.cat(
-                    [speech_token_bt, text_for_no_condition],
-                    dim=0,
-                )
-                time_batched = t_current[None].repeat(2)
-                padding_mask_batched = torch.cat(
-                    [padding_mask_bt, padding_mask_bt],
-                    dim=0,
-                )
-                spkr_emb_batched = torch.cat(
-                    [
-                        spkr_embedding_normed,
-                        torch.zeros_like(spkr_embedding_normed),
-                    ],
-                    dim=0,
-                )
-
-                dphi_all = self.estimator(
-                    middle_point_btd=x_batched,
-                    condition_btd=condition_batched,
-                    text=text_batched,
-                    time_step_1d=time_batched,
-                    padding_mask_bt=padding_mask_batched,
-                    spkr_emb_bd=spkr_emb_batched,
-                    is_causal=is_causal,
-                    block_pattern=block_pattern,
-                )
-
-                dphi_dt, cfg_dphi_dt = dphi_all.chunk(2, dim=0)
-                dphi_dt = (
-                    (1.0 + self.inference_cfg_rate) * dphi_dt
-                    - self.inference_cfg_rate * cfg_dphi_dt
-                )
-            else:
-                dphi_dt = self.estimator(
-                    middle_point_btd=x,
-                    condition_btd=condition_btd,
-                    text=speech_token_bt,
-                    time_step_1d=t_current[None],
-                    padding_mask_bt=padding_mask_bt,
-                    spkr_emb_bd=spkr_embedding_normed,
-                    is_causal=is_causal,
-                    block_pattern=block_pattern,
-                )
-
-            # Euler Step
             x = x + dt * dphi_dt
-            
-            # Update time
             t_current = t_current + dt
-            sol.append(x)
-            
-            # Update dt for the next step
             if step < len(t_span) - 1:
                 dt = t_span[step + 1] - t_current
 
-        result_btd = sol[-1]
+        result_btd = x.float()
         return result_btd, current_step2cache
