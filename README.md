@@ -172,7 +172,7 @@ curl --location 'http://10.2.0.84:8048/voices/clone'
 # Note: Synchronous generation. The first request (cold start/graph compilation) 
 # may take approximately 5 minutes to return.
 # Request:
-sudo curl --location 'http://10.2.0.84:8049/tts/generate' --header 'Content-Type: application/json' --data '{
+sudo curl --location 'http://10.2.0.84:8048/tts/generate' --header 'Content-Type: application/json' --data '{
     "voice_id": "jiayan",
     "input_text": "今天天气好"
 }' -o test.wav --dump-header info.txt

@@ -178,7 +178,7 @@ curl --location 'http://10.2.0.84:8048/voices/clone'
 # 接口返回二进制 WAV 流，并将推理性能指标封装在 HTTP Header 中。
 # 注意：同步生成，首次请求（图编译）返回时间约为 5 分钟左右。
 # 请求示例：
-curl --location 'http://10.2.0.84:8049/tts/generate' --header 'Content-Type: application/json' --data '{
+curl --location 'http://10.2.0.84:8048/tts/generate' --header 'Content-Type: application/json' --data '{
     "voice_id": "jiayan",
     "input_text": "今天天气好"
 }' -o test.wav --dump-header info.txt
