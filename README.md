@@ -150,8 +150,35 @@ sudo docker run -d \
   --restart unless-stopped \
   mongo:7
 
-# Launch the backend service on your NPU 910B environment
-./glmtts_api.sh
+# Launch the backend service on your NPU 910B environment (choose one of the following)
+
+# Option A: default mode, without OM
+bash glmtts_api.sh
+
+# Option B: OM mode
+# Prepare OM artifacts offline first. This step is optional, time-consuming,
+# and only needs to be done in advance when you want to enable the Flow OM backend.
+# OM compilation is device-dependent. Before running export_flow_om.sh, set
+# FLOW_OM_SOC_VERSION according to the target Ascend device / CANN environment.
+# Example:
+# export FLOW_OM_SOC_VERSION=Ascend910B1
+bash export_flow_onnx.sh
+bash export_flow_om.sh
+
+# Then start the API with OM enabled
+GLMTTS_FLOW_OM_ENABLE=1 bash glmtts_api.sh
+
+# Optional runtime variables for OM mode
+# export GLMTTS_FLOW_OM_DIR=exported/flow_om
+# export GLMTTS_FLOW_OM_BUCKETS=256,512,768,1024
+# export GLMTTS_FLOW_OM_PREFIX=flow_estimator_v2_b
+# export GLMTTS_FLOW_OM_DEVICE_ID=0
+
+# Notes:
+# - Option A and Option B are alternatives. Do not run both.
+# - OM support is optional and disabled by default.
+# - `FLOW_OM_SOC_VERSION` should be set according to the target Ascend device.
+# - Runtime only needs the compiled `*.om` files. The `*.onnx` files are only needed if you want to rebuild the OM artifacts.
 
 # [Step 1] Clone
 # Description: Register a voice by uploading a reference audio (3-10s). 

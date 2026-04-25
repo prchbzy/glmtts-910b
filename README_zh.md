@@ -157,9 +157,35 @@ sudo docker run -d \
   --restart unless-stopped \
   mongo:7
 
-# 1. 启动 API 服务
-# 在 NPU 910B 环境中启动后端服务：
-./glmtts_api.sh
+# 1. 启动 API 服务（以下两种方式二选一）
+
+# 方式 A：默认方式，不使用 OM
+bash glmtts_api.sh
+
+# 方式 B：OM 方式
+# 先离线准备 OM 产物。这一步是可选步骤，耗时较长，
+# 只有在需要启用 Flow OM 后端时才需要提前执行一次。
+# OM 编译和目标设备环境相关。执行 export_flow_om.sh 前，
+# 请根据目标 Ascend 设备 / CANN 环境设置 FLOW_OM_SOC_VERSION。
+# 例如：
+# export FLOW_OM_SOC_VERSION=Ascend910B1
+bash export_flow_onnx.sh
+bash export_flow_om.sh
+
+# 然后使用 OM 模式启动 API
+GLMTTS_FLOW_OM_ENABLE=1 bash glmtts_api.sh
+
+# OM 模式可选运行时环境变量
+# export GLMTTS_FLOW_OM_DIR=exported/flow_om
+# export GLMTTS_FLOW_OM_BUCKETS=256,512,768,1024
+# export GLMTTS_FLOW_OM_PREFIX=flow_estimator_v2_b
+# export GLMTTS_FLOW_OM_DEVICE_ID=0
+
+# 说明：
+# - 方式 A 和方式 B 二选一，不需要同时执行。
+# - OM 功能为可选能力，默认关闭。
+# - `FLOW_OM_SOC_VERSION` 需要根据目标 Ascend 设备进行设置。
+# - 运行时只需要编译后的 `*.om` 文件；`*.onnx` 仅在需要重新编译 OM 时使用。
 
 # 2. [第一步] 音色克隆
 # 接口说明：通过上传 3-10 秒的参考音频注册音色，获取唯一的 voice_id。

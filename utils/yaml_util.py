@@ -19,6 +19,17 @@ import os
 import safetensors
 from utils.whisper_models.configuration_whisper import WhisperVQConfig
 from utils.whisper_models.modeling_whisper import WhisperVQEncoder
+from flow.om_runtime import maybe_create_flow_om_manager
+
+def _resolve_flow_dtype(device):
+    requested = os.environ.get('GLMTTS_FLOW_DTYPE', 'fp32').strip().lower()
+    if requested in {'', 'fp32', 'float32', 'none'}:
+        return None
+    if requested in {'bf16', 'bfloat16'}:
+        return torch.bfloat16
+    if requested in {'fp16', 'float16', 'half'}:
+        return torch.float16
+    raise ValueError(f'Unsupported GLMTTS_FLOW_DTYPE: {requested}')
 
 def load_flow_model(flow_ckpt_path, config_path, device):
     with open(config_path, 'r') as f:
@@ -33,7 +44,16 @@ def load_flow_model(flow_ckpt_path, config_path, device):
         flow.load_state_dict(tmp)
 
     flow.to(device)
+    flow_dtype = _resolve_flow_dtype(device)
+    if flow_dtype is not None:
+        flow = flow.to(dtype=flow_dtype)
     flow.eval()
+    flow.om_estimator_manager = None
+    flow.om_estimator_manager_initialized = False
+    flow_om_enabled = os.environ.get('GLMTTS_FLOW_OM_ENABLE', '').strip().lower() in {'1', 'true', 'yes', 'on'}
+    if flow_om_enabled:
+        flow.om_estimator_manager = maybe_create_flow_om_manager()
+        flow.om_estimator_manager_initialized = True
     print(f"[load_flow_model] flow dtype: {next(flow.parameters()).dtype}")
     return flow
 

@@ -107,7 +107,7 @@ def init_weights(m, mean=0.0, std=0.01):
 # Repetition Aware Sampling in VALL-E 2
 def ras_sampling(weighted_scores, decoded_tokens, sampling, top_p=0.8, top_k=25, win_size=10, tau_r=0.1, temperature=1.0):
     top_ids = nucleus_sampling(weighted_scores, top_p=top_p, top_k=top_k, temperature=temperature)
-    rep_num = (torch.tensor(decoded_tokens[-win_size:]).to(weighted_scores.device) == top_ids).sum().item()
+    rep_num = sum(token == int(top_ids.item()) for token in decoded_tokens[-win_size:])
     if rep_num >= win_size * tau_r:
         top_ids = random_sampling(weighted_scores, decoded_tokens, sampling)
     return top_ids
